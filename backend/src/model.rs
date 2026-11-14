@@ -110,6 +110,26 @@ pub enum Kind {
     Telesignal { ggio: u32, ind: u32, value: bool, gen: Gen },
     /// `follow_cb`: id CB; nilai jadi 0 selama CB tidak close (mis. arus saat CB open)
     Telemetry { mx: Mx, value: f64, gen: Gen, follow_cb: Option<String> },
+    /// `PTOC<inst>` / `PDIS<inst>`: Op (ACT) + Str (ACD). Skenario trip membuka CB `cb` (id komponen CB).
+    Protection { class: ProtClass, inst: u32, cb: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProtClass {
+    /// arus lebih
+    Ptoc,
+    /// jarak (distance)
+    #[allow(dead_code)] // dipilih saat tambah komponen dari UI (fase 8)
+    Pdis,
+}
+
+impl ProtClass {
+    pub fn ln(self, inst: u32) -> String {
+        match self {
+            Self::Ptoc => format!("PTOC{inst}"),
+            Self::Pdis => format!("PDIS{inst}"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -268,6 +288,7 @@ pub fn validate(cfg: &IedConfig) -> Result<(), String> {
             Kind::CircuitBreaker(cb) => (cb.inst, format!("XCBR{}", cb.inst), String::new()),
             Kind::TapChanger { inst, .. } => (*inst, format!("ATCC{inst}"), String::new()),
             Kind::Telesignal { ggio, ind, .. } => ((*ggio).min(*ind), format!("GGIO{ggio}"), format!("Ind{ind}")),
+            Kind::Protection { class, inst, .. } => (*inst, class.ln(*inst), String::new()),
             Kind::Telemetry { mx, .. } => (mx.inst, mx.ln(), mx.path()),
         };
         if inst == 0 {
@@ -294,6 +315,11 @@ pub fn validate(cfg: &IedConfig) -> Result<(), String> {
                 }
                 if *interval_ms < 100 {
                     return Err(err("interval minimal 100 ms".into()));
+                }
+            }
+            Kind::Protection { cb, .. } => {
+                if !cbs.contains(cb.as_str()) {
+                    return Err(err(format!("cb '{cb}' bukan id circuit breaker")));
                 }
             }
             Kind::Telesignal { gen, .. } => {
@@ -532,6 +558,22 @@ pub fn build(cfg: &IedConfig) -> Built {
                         });
                     }
                 }
+                Kind::Protection { class, inst, .. } => {
+                    let lnn = class.ln(*inst);
+                    let p = ln(&lnn);
+                    ffi::CDC_ACT_create(c("Op").as_ptr(), p, 0);
+                    ffi::CDC_ACD_create(c("Str").as_ptr(), p, 0);
+                    for d in ["Op", "Str"] {
+                        b.points.push(Point {
+                            value_ref: format!("{lnn}.{d}.general"),
+                            t_ref: format!("{lnn}.{d}.t"),
+                            init: Val::Bool(false),
+                            gen: Gen::manual(),
+                            follow: None,
+                        });
+                        st.push(format!("{lnn}$ST${d}"));
+                    }
+                }
                 Kind::Telesignal { ggio, ind: k, value, gen } => {
                     let lnn = format!("GGIO{ggio}");
                     ffi::CDC_SPS_create(c(&format!("Ind{k}")).as_ptr(), ln(&lnn), 0);
@@ -615,6 +657,8 @@ pub fn build(cfg: &IedConfig) -> Built {
 /// Reference titik-titik satu komponen (relatif ke LD), untuk tampilan & ubah manual dari UI.
 pub enum Refs {
     Cb { xcbr: String, cswi: String },
+    /// LN proteksi (PTOC1 / PDIS1)
+    Prot { ln: String },
     Tap { yltc: String, atcc: String },
     /// telesignal / telemetry: DO + atribut nilai (`stVal` / `mag.f` / `cVal.mag.f`)
     Point { do_ref: String, value_ref: String },
@@ -663,6 +707,7 @@ impl Component {
         match &self.kind {
             Kind::CircuitBreaker(cb) => Refs::Cb { xcbr: format!("XCBR{}", cb.inst), cswi: format!("CSWI{}", cb.inst) },
             Kind::TapChanger { inst, .. } => Refs::Tap { yltc: format!("YLTC{inst}"), atcc: format!("ATCC{inst}") },
+            Kind::Protection { class, inst, .. } => Refs::Prot { ln: class.ln(*inst) },
             Kind::Telesignal { ggio, ind, .. } => {
                 let do_ref = format!("GGIO{ggio}.Ind{ind}");
                 Refs::Point { value_ref: format!("{do_ref}.stVal"), do_ref }
@@ -688,6 +733,9 @@ impl Component {
             (Kind::TapChanger { min, max, ctl, interval_ms, .. }, Refs::Tap { yltc, atcc }) => json!({
                 "id": self.id, "type": "tap", "ln": format!("{yltc} / {atcc}"), "ctl_model": ctl.name(),
                 "min": min, "max": max, "interval_ms": interval_ms,
+            }),
+            (Kind::Protection { cb, .. }, Refs::Prot { ln }) => json!({
+                "id": self.id, "type": "protection", "ln": ln, "cb": cb,
             }),
             (Kind::Telesignal { gen: g, .. }, Refs::Point { do_ref, .. }) => json!({
                 "id": self.id, "type": "telesignal", "ref": do_ref, "gen": gen(g),

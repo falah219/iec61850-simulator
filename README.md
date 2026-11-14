@@ -40,6 +40,38 @@ Socket.IO dari UI: `subscribe_ied` / `unsubscribe_ied` (room per IED), `set_valu
 (hasil lewat ack `{ok, message}`), `get_initial_data`. Ke UI: `ieds`, `components` (config + nilai),
 `value_changed` (hanya yang berubah, tiap 300 ms, hanya ke room IED itu), `event_log`, `error`.
 
+## Skenario (UI + HTTP API)
+
+Di UI: panel **Skenario** di detail IED (+ tombol cepat Mati / Hang / Putus di daftar IED), hasil
+muncul sebagai toast dan di panel **Log kejadian** (filter jenis, jeda, bersihkan).
+
+| Skenario | Jalankan (`POST /ieds/{ied}/scenarios/{s}`, body opsional) | Hentikan (`.../{s}/stop`) |
+|---|---|---|
+| `trip` | `{"prot": "prot1", "pulse_ms": 200}`: Str & Op naik, +20 ms CB Pos `00` (intermediate), + waktu tempuh Pos `01` (open), arus/daya yang ikut CB jadi 0, Op & Str turun setelah pulse. CB sudah open: hanya pulsa Op | - |
+| `off` | IED mati: listener proxy & koneksi ditutup, IedServer di-stop & dihancurkan (beserta model) | dibuat ulang dari konfigurasi seperti reboot: buffer report kosong, nilai awal (urutan kartu tetap) |
+| `hang` | proxy berhenti meneruskan data, TCP tetap terbuka | lanjutkan (data yang tertahan diteruskan) |
+| `disconnect` | `{"mode": "fin"\|"rst"}`: semua koneksi client ditutup (FIN, atau RST lewat SO_LINGER 0), IED tetap hidup | - |
+| `delay` | `{"ms": 1000}`: jeda tiap data yang diteruskan proxy | delay 0 |
+| `quality` | `{"validity": "invalid"\|"questionable", "flags": ["oldData", "substituted", "test", ...], "components": ["mw"]}` (tanpa `components` = semua) | normalkan: hanya q kembali good di semua komponen (nilai tidak berubah), report qchg terkirim |
+| `clock` | `{"not_sync": true}` / `{"failure": true}`: time quality di timestamp berikutnya | normal |
+| `storm` | `{"rate": 50, "duration": 30}`: semua telemetry & telesignal berubah `rate` kali/detik (1..1000) selama `duration` detik | berhenti (atau otomatis setelah durasi) |
+
+Ubah satu titik: `PUT /ieds/{ied}/points/{ref}` dengan `ref` = id komponen atau reference
+(`cb1`, `XCBR1`, `MMXU1.TotW`, `GGIO1.Ind1`). Body sama dengan ubah manual UI
+(`{"action": "open"}`, `{"local": true}`, `{"auto": false}`, `{"value": 42}`), plus
+`{"quality": {"validity": "invalid", "flags": ["oldData"]}}`. Jawaban: `{ok, message}`; 400 kalau ditolak, 404 kalau IED tidak ada.
+
+```sh
+curl -X POST localhost:6061/ieds/SIMIED1/scenarios/trip
+curl -X POST localhost:6061/ieds/SIMIED1/scenarios/delay -d '{"ms": 500}'
+curl -X POST localhost:6061/ieds/SIMIED1/scenarios/delay/stop
+curl -X PUT  localhost:6061/ieds/SIMIED1/points/MMXU1.TotW -d '{"quality": {"validity": "questionable", "flags": ["oldData"]}}'
+curl "localhost:6061/events?ied=SIMIED1&type=scenario"
+```
+
+Socket.IO: `run_scenario {ied, scenario, params}`, `stop_scenario {ied, scenario}` (ack `{ok, message}`).
+`GET /ieds` menambah `status` (`running` / `off` / `hang`), `delay_ms`, `scenarios` (quality, clock, storm).
+
 ## Banyak IED, proxy, log kejadian
 
 Setiap IED: IedServer libIEC61850 listen di `127.0.0.1:<port acak>`, proxy TCP memegang port publik.
@@ -58,7 +90,8 @@ Skenario hang / putus koneksi / delay memakai proxy ini di fase 7.
 | `rcb` | RCB enable (BRCB/URCB, dataset, oleh client), disable, GI, buffer overflow |
 | `control` | select / operate diterima / ditolak + AddCause / selesai + CommandTermination, unselect (cancel, sboTimeout, client putus); dengan orIdent, orCat, alamat client |
 | `report` | jumlah report terkirim per RCB, dikelompokkan per detik |
-| `manual` | perubahan dari UI (CB open/close, L/R, tap, auto, nilai) |
+| `manual` | perubahan dari UI / API (CB open/close, L/R, tap, auto, nilai, quality) |
+| `scenario` | skenario mulai / selesai |
 
 Socket.IO: `ieds` (dikirim saat terhubung dan setiap ada perubahan, maks 1x/detik), `event_log`
 (200 kejadian terakhir saat terhubung, lalu real-time). Semua kejadian juga ditulis ke log backend
@@ -78,6 +111,7 @@ Socket.IO: `ieds` (dikirim saat terhubung dan setiap ada perubahan, maks 1x/deti
 | kV fasa A | `MMXU1.PhV.phsA` | sine 19..21 |
 | A fasa A | `MMXU1.A.phsA` | sine 200..400, ikut `cb1` |
 | Generik | `GGIO1.AnIn1` | manual 123.4 |
+| Proteksi `prot1` | `PTOC1.Op` (ACT), `PTOC1.Str` (ACD), trip `cb1` | skenario trip |
 | Wajib | `LLN0.Mod/Beh/Health/NamPlt`, `LPHD1.PhyNam/PhyHealth/Proxy` | |
 
 "Ikut `cb1`" = nilai 0 selama CB tidak close. Dataset & RCB otomatis di `LLN0`:

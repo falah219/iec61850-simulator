@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { Toaster, toast } from 'sonner';
 import socket from './socket';
-import type { IedInfo } from './types';
+import type { EventLog, IedInfo } from './types';
 import { IedList } from './pages/IedList';
 import { IedDetail } from './pages/IedDetail';
 
@@ -15,12 +15,22 @@ function App() {
   const [connected, setConnected] = useState(socket.connected);
   const [ieds, setIeds] = useState<IedInfo[]>([]);
   const [ied, setIed] = useState(routeIed);
+  // log kejadian semua IED (backend kirim 200 terakhir saat terhubung, lalu real-time); dibatasi 3000 di UI
+  const [events, setEvents] = useState<EventLog[]>([]);
 
   useEffect(() => {
     const onConnect = () => setConnected(true);
     const onDisconnect = () => setConnected(false);
     const onError = (e: { message: string }) => toast.error(e.message);
     const onHash = () => setIed(routeIed());
+    // socketioxide mengirim array 1 elemen sebagai objek tunggal, jadi terima keduanya
+    const onEvents = (data: EventLog[] | EventLog) =>
+      setEvents((ev) => {
+        const list = Array.isArray(data) ? data : [data];
+        const last = ev.at(-1)?.id ?? 0;
+        return [...ev, ...list.filter((e) => e.id > last)].slice(-3000); // id naik terus; abaikan duplikat saat reconnect
+      });
+    socket.on('event_log', onEvents);
     socket.on('connect', onConnect);
     socket.on('disconnect', onDisconnect);
     socket.on('ieds', setIeds);
@@ -31,6 +41,7 @@ function App() {
       socket.off('disconnect', onDisconnect);
       socket.off('ieds', setIeds);
       socket.off('error', onError);
+      socket.off('event_log', onEvents);
       window.removeEventListener('hashchange', onHash);
     };
   }, []);
@@ -56,7 +67,7 @@ function App() {
         </span>
       </div>
       {ied ? (
-        <IedDetail name={ied} info={ieds.find((i) => i.name === ied)} back={() => go(null)} />
+        <IedDetail name={ied} info={ieds.find((i) => i.name === ied)} back={() => go(null)} events={events} />
       ) : (
         <IedList ieds={ieds} open={go} />
       )}

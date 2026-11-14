@@ -24,7 +24,7 @@ fn main() {
             "LibIEC61850_getVersionString|IedServer_.*|IedModel_.*|LogicalDevice_create|LogicalNode_create|CDC_.*_create|Dbpos_.*\
              |DataSet_create|DataSetEntry_create|DataAttribute_create|ReportControlBlock_create\
              |ReportControlBlock_getName|ReportControlBlock_isBuffered|ReportControlBlock_getRptEna|ControlAction_.*|ClientConnection_getPeerAddress\
-             |MmsValue_getBoolean|MmsValue_newBoolean|MmsValue_delete|Quality_fromMmsValue\
+             |MmsValue_getBoolean|MmsValue_newBoolean|MmsValue_delete|Quality_fromMmsValue|MmsValue_getUtcTimeQuality\
              |IedConnection_create|IedConnection_connect|IedConnection_close|IedConnection_destroy|ControlObjectClient_.*\
              |IedConnection_getRCBValues|IedConnection_setRCBValues|ClientReportControlBlock_.*",
         )

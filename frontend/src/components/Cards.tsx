@@ -1,6 +1,6 @@
 // Kartu komponen, gaya meniru CircuitBreakerItem / TapChangerItem / TeleSignalItem / TeleMetryItem acuan.
 import { useEffect, useState } from 'react';
-import type { CbComp, SetCmd, TapComp, TmComp, TsComp } from '../types';
+import type { CbComp, ProtComp, SetCmd, TapComp, TmComp, TsComp } from '../types';
 import { AutoButton, Button, LocalRemote, Meta } from '../ui';
 
 type Props<T> = { c: T; send: (cmd: SetCmd) => void; dragging: boolean };
@@ -181,6 +181,35 @@ export function Telemetry({ c, send, dragging }: Props<TmComp>) {
             className="w-32 disabled:opacity-50"
           />
         )}
+      </div>
+    </div>
+  );
+}
+
+/** Proteksi (PTOC/PDIS): lampu Str & Op, tombol Trip (skenario trip untuk proteksi ini) */
+export function Protection({ c, trip, dragging }: { c: ProtComp; trip: () => void; dragging: boolean }) {
+  const lamp = (on: boolean, label: string) => (
+    <div className="flex flex-col items-center gap-1">
+      <div className={`w-10 h-10 rounded-full border-2 border-orange-600 ${on ? 'bg-orange-500' : 'bg-orange-100 opacity-50'}`} />
+      <span className="text-xs font-bold">{label}</span>
+    </div>
+  );
+  return (
+    <div className="p-3 flex items-center border-b-2">
+      <div className="w-1/3 text-center">
+        <p className="font-bold">{c.id}</p>
+        <p className="text-xs text-gray-500 font-mono">{c.ln}</p>
+        <p className="text-xs text-gray-500">trip {c.cb}</p>
+      </div>
+      <div className="w-1/3 flex justify-center gap-4">
+        {lamp(c.str, 'Str')}
+        {lamp(c.op, 'Op')}
+      </div>
+      <div className="w-1/3 flex flex-col items-center gap-1">
+        <Button className="px-4 h-9 bg-orange-500 hover:bg-orange-400 text-white" onClick={trip} disabled={dragging}>
+          Trip
+        </Button>
+        <Meta q={c.q} t={c.t} />
       </div>
     </div>
   );

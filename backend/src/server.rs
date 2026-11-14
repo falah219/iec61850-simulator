@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use crate::behavior::{Mode, Rng};
@@ -14,7 +15,7 @@ use crate::client::add_cause_name;
 use crate::events::{Events, Kind as Ev};
 use crate::ffi;
 use crate::model::{self, CtlAct, CtlSpec, IedConfig, Point, Refs, Val};
-use crate::proxy::{self, Client};
+use crate::proxy::{self, Client, Net};
 
 const VENDOR: &str = "iec61850-simulator";
 /// Resolusi generator. ponytail: interval titik dibulatkan ke 100 ms; kecilkan kalau butuh lebih halus
@@ -36,6 +37,8 @@ pub struct IedCtx {
     rcbs: Mutex<Vec<(String, String)>>,
     /// jumlah report yang dibuat per RCB sejak flush terakhir
     reports: Mutex<Vec<(String, u32)>>,
+    /// state jaringan proxy (hang / delay / putus)
+    pub net: watch::Sender<Net>,
 }
 
 impl IedCtx {
@@ -245,43 +248,87 @@ fn dbpos_name(d: ffi::Dbpos) -> &'static str {
     }
 }
 
-/// Quality untuk UI: `{"raw": u16, "text": "good" | "invalid+oldData" | ...}`
-fn quality(server: ffi::IedServer, a: &Attr) -> Value {
-    // SAFETY: server & attr valid, attr Quality (bit-string)
-    let q = unsafe { ffi::Quality_fromMmsValue(ffi::IedServer_getAttributeValue(server, a.0)) } as u32;
+/// Flag quality (selain validity) beserta namanya di UI / API
+const QUALITY_FLAGS: [(u32, &str); 11] = [
+    (ffi::QUALITY_DETAIL_OVERFLOW, "overflow"),
+    (ffi::QUALITY_DETAIL_OUT_OF_RANGE, "outOfRange"),
+    (ffi::QUALITY_DETAIL_BAD_REFERENCE, "badReference"),
+    (ffi::QUALITY_DETAIL_OSCILLATORY, "oscillatory"),
+    (ffi::QUALITY_DETAIL_FAILURE, "failure"),
+    (ffi::QUALITY_DETAIL_OLD_DATA, "oldData"),
+    (ffi::QUALITY_DETAIL_INCONSISTENT, "inconsistent"),
+    (ffi::QUALITY_DETAIL_INACCURATE, "inaccurate"),
+    (ffi::QUALITY_SOURCE_SUBSTITUTED, "substituted"),
+    (ffi::QUALITY_TEST, "test"),
+    (ffi::QUALITY_OPERATOR_BLOCKED, "operatorBlocked"),
+];
+
+/// "good" | "invalid+oldData" | ...
+fn quality_text(q: u32) -> String {
     let mut t = vec![match q & 3 {
         ffi::QUALITY_VALIDITY_GOOD => "good",
         ffi::QUALITY_VALIDITY_INVALID => "invalid",
         ffi::QUALITY_VALIDITY_QUESTIONABLE => "questionable",
         _ => "reserved",
     }];
-    for (bit, name) in [
-        (ffi::QUALITY_DETAIL_OVERFLOW, "overflow"),
-        (ffi::QUALITY_DETAIL_OUT_OF_RANGE, "outOfRange"),
-        (ffi::QUALITY_DETAIL_BAD_REFERENCE, "badReference"),
-        (ffi::QUALITY_DETAIL_OSCILLATORY, "oscillatory"),
-        (ffi::QUALITY_DETAIL_FAILURE, "failure"),
-        (ffi::QUALITY_DETAIL_OLD_DATA, "oldData"),
-        (ffi::QUALITY_DETAIL_INCONSISTENT, "inconsistent"),
-        (ffi::QUALITY_DETAIL_INACCURATE, "inaccurate"),
-        (ffi::QUALITY_SOURCE_SUBSTITUTED, "substituted"),
-        (ffi::QUALITY_TEST, "test"),
-        (ffi::QUALITY_OPERATOR_BLOCKED, "operatorBlocked"),
-    ] {
-        if q & bit != 0 {
-            t.push(name);
-        }
+    t.extend(QUALITY_FLAGS.iter().filter(|(bit, _)| q & bit != 0).map(|(_, n)| *n));
+    t.join("+")
+}
+
+/// `{"validity": "invalid"|"questionable"|"good", "flags": ["oldData", ...]}` -> Quality (default invalid)
+fn parse_quality(p: &Value) -> Result<u16, String> {
+    let mut q = match p["validity"].as_str().unwrap_or("invalid") {
+        "good" => ffi::QUALITY_VALIDITY_GOOD,
+        "invalid" => ffi::QUALITY_VALIDITY_INVALID,
+        "questionable" => ffi::QUALITY_VALIDITY_QUESTIONABLE,
+        v => return Err(format!("validity tidak dikenal: {v} (good/invalid/questionable)")),
+    };
+    for f in p["flags"].as_array().into_iter().flatten() {
+        let f = f.as_str().unwrap_or_default();
+        let (bit, _) = QUALITY_FLAGS.iter().find(|(_, n)| *n == f).ok_or_else(|| format!("flag quality tidak dikenal: {f}"))?;
+        q |= bit;
     }
-    json!({ "raw": q, "text": t.join("+") })
+    Ok(q as u16)
+}
+
+fn set_quality(server: ffi::IedServer, qs: &[Attr], q: u16) {
+    // SAFETY: server & attr valid, attr Quality; report qchg dikirim libIEC61850 otomatis
+    unsafe {
+        ffi::IedServer_lockDataModel(server);
+        for a in qs {
+            ffi::IedServer_updateQuality(server, a.0, q);
+        }
+        ffi::IedServer_unlockDataModel(server);
+    }
+}
+
+/// Quality untuk UI: `{"raw": u16, "text": "good" | "invalid+oldData" | ...}`
+fn quality(server: ffi::IedServer, a: &Attr) -> Value {
+    // SAFETY: server & attr valid, attr Quality (bit-string)
+    let q = unsafe { ffi::Quality_fromMmsValue(ffi::IedServer_getAttributeValue(server, a.0)) } as u32;
+    json!({ "raw": q, "text": quality_text(q) })
 }
 
 impl View {
     fn new(inner: &Inner, c: &model::Component) -> Result<Self, String> {
+        let dos: Vec<String> = match c.refs() {
+            Refs::Cb { xcbr, cswi } => vec![format!("{xcbr}.Pos"), format!("{cswi}.Pos"), format!("{xcbr}.Loc"), format!("{cswi}.Loc")],
+            Refs::Tap { yltc, atcc } => vec![format!("{yltc}.TapPos"), format!("{atcc}.TapChg"), format!("{atcc}.Auto"), format!("{atcc}.Loc")],
+            Refs::Prot { ln } => vec![format!("{ln}.Op"), format!("{ln}.Str")],
+            Refs::Point { do_ref, .. } => vec![do_ref],
+        };
+        let qs = dos.iter().map(|d| inner.attr(&format!("{d}.q"))).collect::<Result<Vec<_>, _>>()?;
         let kind = match (c.refs(), &c.kind) {
-            (Refs::Cb { xcbr, cswi }, _) => VKind::Cb {
+            (Refs::Cb { xcbr, cswi }, model::Kind::CircuitBreaker(cb)) => VKind::Cb {
                 pos: [inner.pt(&format!("{xcbr}.Pos"), "stVal")?, inner.pt(&format!("{cswi}.Pos"), "stVal")?],
                 loc: [inner.pt(&format!("{xcbr}.Loc"), "stVal")?, inner.pt(&format!("{cswi}.Loc"), "stVal")?],
                 q: inner.attr(&format!("{xcbr}.Pos.q"))?,
+                travel: Duration::from_millis(cb.travel_ms),
+            },
+            (Refs::Prot { ln }, model::Kind::Protection { cb, .. }) => VKind::Prot {
+                op: inner.pt(&format!("{ln}.Op"), "general")?,
+                start: inner.pt(&format!("{ln}.Str"), "general")?,
+                cb: cb.clone(),
             },
             (Refs::Tap { yltc, atcc }, model::Kind::TapChanger { min, max, .. }) => VKind::Tap {
                 pos: inner.pt(&format!("{atcc}.TapChg"), "valWTr.posVal")?,
@@ -301,7 +348,7 @@ impl View {
             },
             _ => unreachable!("refs() sesuai kind"),
         };
-        Ok(Self { id: c.id.clone(), desc: c.describe(), kind })
+        Ok(Self { id: c.id.clone(), desc: c.describe(), kind, qs })
     }
 }
 
@@ -632,8 +679,13 @@ pub struct Ied {
     views: Vec<View>,
     /// Urutan kartu di UI (id komponen). ponytail: hanya di memori; disimpan bersama autosave di fase 8
     order: Mutex<Vec<String>>,
-    task: JoinHandle<()>,
-    proxy: JoinHandle<()>,
+    /// skenario yang sedang aktif selain jaringan: (quality, clock) untuk status
+    scen: Mutex<(Option<String>, Option<String>)>,
+    /// task proxy & generator; diambil oleh [`Ied::shutdown`]
+    proxy: Mutex<Option<JoinHandle<()>>>,
+    task: Mutex<Option<JoinHandle<()>>>,
+    /// task badai data yang sedang jalan
+    storm: Mutex<Option<JoinHandle<()>>>,
 }
 
 /// Satu komponen untuk UI: deskripsi statis + atribut untuk baca nilai live & ubah manual.
@@ -641,11 +693,15 @@ struct View {
     id: String,
     desc: Value,
     kind: VKind,
+    /// semua atribut q komponen ini (skenario quality)
+    qs: Vec<Attr>,
 }
 
 enum VKind {
     /// pos: [XCBR.Pos, CSWI.Pos], loc: [XCBR.Loc, CSWI.Loc]
-    Cb { pos: [Pt; 2], loc: [Pt; 2], q: Attr },
+    Cb { pos: [Pt; 2], loc: [Pt; 2], q: Attr, travel: Duration },
+    /// proteksi: Op (ACT) & Str (ACD) `.general`; `cb` = id komponen CB yang di-trip
+    Prot { op: Pt, start: Pt, cb: String },
     /// pos: ATCC.TapChg posVal, mirror: YLTC.TapPos
     Tap { pos: Pt, mirror: Pt, auto: Pt, loc: Pt, q: Attr, min: i32, max: i32 },
     /// telesignal (bool) / telemetry (float); state generator dicari lewat `value_ref`
@@ -678,6 +734,7 @@ impl Ied {
             clients: Mutex::new(Vec::new()),
             rcbs: Mutex::new(Vec::new()),
             reports: Mutex::new(Vec::new()),
+            net: watch::Sender::new(Net::default()),
         });
         let mut inner = Inner { name: cfg.name.clone(), ld: cfg.ld.clone(), model: built.model, server, ctls: Vec::new(), ctx: Arc::clone(&ctx) };
 
@@ -709,17 +766,38 @@ impl Ied {
         let inner = Arc::new(inner);
 
         let points = Arc::new(Mutex::new(live));
-        let task = tokio::spawn(generate(Arc::clone(&inner), Arc::clone(&points)));
-        let proxy = tokio::spawn(proxy::run(public, internal, Arc::clone(&ctx)));
+        let task = Mutex::new(Some(tokio::spawn(generate(Arc::clone(&inner), Arc::clone(&points)))));
+        let proxy = Mutex::new(Some(tokio::spawn(proxy::run(public, internal, Arc::clone(&ctx)))));
         let order = Mutex::new(views.iter().map(|v| v.id.clone()).collect());
-        Ok(Self { name: cfg.name.clone(), port: cfg.port, ctx, inner, points, views, order, task, proxy })
+        let (scen, storm) = (Mutex::new((None, None)), Mutex::new(None));
+        Ok(Self { name: cfg.name.clone(), port: cfg.port, ctx, inner, points, views, order, scen, proxy, task, storm })
+    }
+
+    /// IED mati: listener proxy & semua koneksi ditutup, generator berhenti, IedServer di-stop.
+    /// Selesai = port publik sudah bebas. Server & model dihancurkan saat `Ied` terakhir di-drop.
+    pub async fn shutdown(&self) {
+        let handles = [lock(&self.proxy).take(), lock(&self.task).take(), lock(&self.storm).take()];
+        for h in handles.into_iter().flatten() {
+            h.abort();
+            let _ = h.await; // task benar-benar selesai -> listener & koneksi tertutup
+        }
+        // SAFETY: server valid; idempoten (Drop Inner memanggil stop lagi)
+        unsafe { ffi::IedServer_stop(self.inner.server) };
+    }
+
+    /// Urutan kartu sekarang (dibawa ke IED baru saat dihidupkan lagi)
+    pub fn order(&self) -> Vec<String> {
+        lock(&self.order).clone()
     }
 
     /// Nilai live satu komponen: posisi/nilai, auto, local, quality, timestamp
     fn live(&self, v: &View) -> Value {
         let s = self.inner.server;
         match &v.kind {
-            VKind::Cb { pos, loc, q } => json!({
+            VKind::Prot { op, start, .. } => json!({
+                "id": v.id, "op": get_bool(s, &op.v), "str": get_bool(s, &start.v), "q": quality(s, &v.qs[0]), "t": get_time(s, &op.t),
+            }),
+            VKind::Cb { pos, loc, q, .. } => json!({
                 "id": v.id, "pos": dbpos_name(dbpos(s, &pos[0].v)), "local": get_bool(s, &loc[1].v),
                 "q": quality(s, q), "t": get_time(s, &pos[0].t),
             }),
@@ -782,6 +860,13 @@ impl Ied {
     pub fn set(&self, id: &str, cmd: &Value) -> Result<String, String> {
         let v = self.views.iter().find(|v| v.id == id).ok_or_else(|| format!("komponen {id} tidak ada di {}", self.name))?;
         let s = self.inner.server;
+        if let Some(q) = cmd.get("quality") {
+            let raw = parse_quality(q)?;
+            set_quality(s, &v.qs, raw);
+            let msg = format!("{id} quality = {}", quality_text(raw as u32));
+            self.ctx.event(Ev::Manual, format!("{msg} (dari UI/API)"));
+            return Ok(msg);
+        }
         let remote = |id: &str| format!("{id} mode Remote: pindah ke Local dulu untuk operasi dari UI");
         let lr = |l: bool| if l { "Local" } else { "Remote" };
         let msg = match &v.kind {
@@ -826,6 +911,7 @@ impl Ied {
                     format!("{id} {} -> {n}", cmd["action"].as_str().unwrap_or_default())
                 }
             }
+            VKind::Prot { .. } => return Err(format!("{id}: pakai skenario trip")),
             VKind::Point { value_ref, is_bool, .. } => {
                 let mut pts = lock(&self.points);
                 let l = pts.iter_mut().find(|l| l.p.value_ref == *value_ref).ok_or("titik tidak ditemukan")?;
@@ -850,14 +936,192 @@ impl Ied {
                 }
             }
         };
-        self.ctx.event(Ev::Manual, format!("{msg} (dari UI)"));
+        self.ctx.event(Ev::Manual, format!("{msg} (dari UI/API)"));
         Ok(msg)
+    }
+
+    /// Komponen dari id atau reference DO/LN (`cb1`, `MMXU1.TotW`, `XCBR1`), untuk `PUT /points/{ref}`.
+    pub fn resolve(&self, r: &str) -> Option<String> {
+        self.views
+            .iter()
+            .find(|v| v.id == r || v.desc["ref"] == r || v.desc["ln"].as_str().is_some_and(|ln| ln.split(" / ").any(|l| l == r)))
+            .map(|v| v.id.clone())
+    }
+
+    /// Jalankan skenario (PLAN bagian 6). Hasil dicatat sebagai kejadian `scenario`.
+    pub fn run_scenario(&self, name: &str, p: &Value) -> Result<String, String> {
+        let s = self.inner.server;
+        let msg = match name {
+            "trip" => self.trip(p)?,
+            "hang" => {
+                self.ctx.net.send_modify(|n| n.hang = true);
+                "hang: proxy berhenti meneruskan data, TCP tetap terbuka".into()
+            }
+            "disconnect" => {
+                let rst = match p["mode"].as_str().unwrap_or("fin") {
+                    "fin" => false,
+                    "rst" => true,
+                    m => return Err(format!("mode putus tidak dikenal: {m} (fin/rst)")),
+                };
+                let n = self.ctx.client_count();
+                self.ctx.net.send_modify(|n| {
+                    n.epoch += 1;
+                    n.rst = rst;
+                });
+                format!("putus koneksi ({}): {n} client ditutup, IED tetap jalan", if rst { "RST" } else { "FIN" })
+            }
+            "delay" => {
+                let ms = p["ms"].as_u64().unwrap_or(1000);
+                if !(1..=60_000).contains(&ms) {
+                    return Err("delay harus 1..60000 ms".into());
+                }
+                self.ctx.net.send_modify(|n| n.delay_ms = ms);
+                format!("delay jaringan {ms} ms")
+            }
+            "quality" => {
+                let raw = parse_quality(p)?;
+                let ids: Option<Vec<&str>> = p["components"].as_array().map(|a| a.iter().filter_map(Value::as_str).collect());
+                let mut n = 0;
+                for v in self.views.iter().filter(|v| ids.as_ref().is_none_or(|ids| ids.contains(&v.id.as_str()))) {
+                    set_quality(s, &v.qs, raw);
+                    n += 1;
+                }
+                if n == 0 {
+                    return Err("tidak ada komponen yang cocok".into());
+                }
+                let text = quality_text(raw as u32);
+                lock(&self.scen).0 = Some(text.clone());
+                format!("quality {text} pada {n} komponen")
+            }
+            "clock" => {
+                let failure = p["failure"].as_bool().unwrap_or(false);
+                let not_sync = p["not_sync"].as_bool().unwrap_or(!failure);
+                // SAFETY: server valid; berlaku untuk timestamp yang ditulis sesudah ini
+                unsafe { ffi::IedServer_setTimeQuality(s, false, failure, not_sync, 0) };
+                let text = [(not_sync, "ClockNotSynchronized"), (failure, "ClockFailure")]
+                    .iter()
+                    .filter(|(on, _)| *on)
+                    .map(|(_, t)| *t)
+                    .collect::<Vec<_>>()
+                    .join("+");
+                lock(&self.scen).1 = Some(text.clone());
+                format!("time quality {text} (berlaku untuk timestamp berikutnya)")
+            }
+            "storm" => {
+                let rate = p["rate"].as_u64().unwrap_or(50);
+                let dur = p["duration"].as_u64().unwrap_or(30);
+                if !(1..=1000).contains(&rate) || !(1..=600).contains(&dur) {
+                    return Err("badai: rate 1..1000 per detik, duration 1..600 s".into());
+                }
+                let mut st = lock(&self.storm);
+                if st.as_ref().is_some_and(|h| !h.is_finished()) {
+                    return Err("badai data sedang jalan".into());
+                }
+                *st = Some(tokio::spawn(storm(Arc::clone(&self.inner), Arc::clone(&self.points), rate, Duration::from_secs(dur))));
+                format!("badai data {dur} s, semua telemetry & telesignal berubah {rate}x/detik")
+            }
+            _ => return Err(format!("skenario tidak dikenal: {name} (trip/off/hang/disconnect/delay/quality/clock/storm)")),
+        };
+        self.ctx.event(Ev::Scenario, format!("mulai {msg}"));
+        Ok(msg)
+    }
+
+    /// Hentikan skenario yang punya keadaan (off -> hidupkan, hang -> lanjutkan, quality -> normalkan, ...).
+    pub fn stop_scenario(&self, name: &str) -> Result<String, String> {
+        let s = self.inner.server;
+        let msg = match name {
+            "hang" => {
+                self.ctx.net.send_modify(|n| n.hang = false);
+                "hang selesai, data diteruskan lagi".into()
+            }
+            "delay" => {
+                self.ctx.net.send_modify(|n| n.delay_ms = 0);
+                "delay jaringan dimatikan".into()
+            }
+            "quality" => {
+                for v in &self.views {
+                    set_quality(s, &v.qs, 0);
+                }
+                lock(&self.scen).0 = None;
+                "quality dinormalkan (good) di semua komponen".into()
+            }
+            "clock" => {
+                // SAFETY: server valid
+                unsafe { ffi::IedServer_setTimeQuality(s, false, false, false, 0) };
+                lock(&self.scen).1 = None;
+                "time quality normal".into()
+            }
+            "storm" => {
+                let h = lock(&self.storm).take().filter(|h| !h.is_finished()).ok_or("badai data tidak sedang jalan")?;
+                h.abort();
+                "badai data dihentikan".into()
+            }
+            "trip" | "disconnect" => return Err(format!("{name} sekali jalan, tidak perlu dihentikan")),
+            _ => return Err(format!("skenario tidak dikenal: {name}")),
+        };
+        self.ctx.event(Ev::Scenario, format!("selesai {msg}"));
+        Ok(msg)
+    }
+
+    /// Trip: Str & Op proteksi naik, Op pulse `pulse_ms` (default 200), CB terkait open lewat intermediate.
+    fn trip(&self, p: &Value) -> Result<String, String> {
+        let prot = self
+            .views
+            .iter()
+            .find(|v| matches!(v.kind, VKind::Prot { .. }) && p["prot"].as_str().is_none_or(|id| id == v.id))
+            .ok_or("tidak ada komponen proteksi (atau id prot salah)")?;
+        let VKind::Prot { op, start, cb } = &prot.kind else { unreachable!() };
+        let cbv = self.views.iter().find(|v| v.id == *cb).ok_or("CB proteksi tidak ditemukan")?;
+        let VKind::Cb { pos, travel, .. } = &cbv.kind else { return Err("cb proteksi bukan CB".into()) };
+        let pulse = Duration::from_millis(p["pulse_ms"].as_u64().unwrap_or(200).clamp(10, 10_000));
+        let (op, start, pos, travel) = (*op, *start, *pos, *travel);
+        let inner = Arc::clone(&self.inner);
+        let was_open = dbpos(inner.server, &pos[0].v) == ffi::DBPOS_OFF;
+        tokio::spawn(async move {
+            let inner = &inner; // Inner Send+Sync; pointer server tidak boleh ditahan melewati await
+            // CB sudah open: hanya pulsa Op (Str tidak naik, Pos tidak berubah)
+            if !was_open {
+                set(inner.server, &start, Val::Bool(true));
+            }
+            set(inner.server, &op, Val::Bool(true));
+            let breaker = async {
+                if was_open {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await; // waktu kerja trip coil
+                // selalu Pos 00 (intermediate) -> 01 (open), juga untuk CB tanpa waktu tempuh
+                pos.iter().for_each(|p| set(inner.server, p, Val::Dbpos(ffi::DBPOS_INTERMEDIATE_STATE)));
+                tokio::time::sleep(travel).await;
+                pos.iter().for_each(|p| set(inner.server, p, Val::Dbpos(ffi::DBPOS_OFF)));
+            };
+            let reset = async {
+                tokio::time::sleep(pulse).await;
+                set(inner.server, &op, Val::Bool(false));
+                if !was_open {
+                    set(inner.server, &start, Val::Bool(false));
+                }
+            };
+            tokio::join!(breaker, reset);
+        });
+        let ms = pulse.as_millis();
+        Ok(if was_open {
+            format!("trip {}: {cb} sudah open, hanya pulsa Op {ms} ms", prot.id)
+        } else {
+            format!("trip {}: Str & Op pulse {ms} ms, {cb} Pos 00 -> 01", prot.id)
+        })
     }
 
     /// Status untuk `GET /ieds` & event Socket.IO `ieds`.
     pub fn info(&self) -> Value {
         let clients = lock(&self.ctx.clients).clone();
         let rcbs = lock(&self.ctx.rcbs).clone();
+        let net = *self.ctx.net.borrow();
+        let scen = lock(&self.scen).clone();
+        let status = if net.hang {
+            "hang"
+        } else {
+            "running"
+        };
         // "report" = ada RCB aktif; client terhubung tanpa RCB aktif = kemungkinan polling
         let mode = match (rcbs.is_empty(), clients.is_empty()) {
             (false, _) => "report",
@@ -867,7 +1131,13 @@ impl Ied {
         json!({
             "name": self.name,
             "port": self.port,
-            "status": "running",
+            "status": status,
+            "delay_ms": net.delay_ms,
+            "scenarios": {
+                "quality": scen.0,
+                "clock": scen.1,
+                "storm": lock(&self.storm).as_ref().is_some_and(|h| !h.is_finished()),
+            },
             "components": self.views.len(),
             "client_count": clients.len(),
             "clients": clients.iter().map(|c| json!({ "addr": c.peer.to_string(), "since": c.since_ms })).collect::<Vec<_>>(),
@@ -885,8 +1155,9 @@ impl Drop for Ied {
     fn drop(&mut self) {
         // Proxy berhenti (koneksi client ditutup); Inner (server) dihancurkan setelah task generator
         // ikut selesai (Arc terakhir)
-        self.proxy.abort();
-        self.task.abort();
+        for h in [lock(&self.proxy).take(), lock(&self.task).take(), lock(&self.storm).take()].into_iter().flatten() {
+            h.abort();
+        }
     }
 }
 
@@ -983,6 +1254,35 @@ async fn generate(inner: Arc<Inner>, points: Arc<Mutex<Vec<Live>>>) {
             }
         }
     }
+}
+
+/// Badai data: semua telemetry & telesignal (GGIO.Ind) berubah `rate` kali per detik selama `dur`.
+/// Menulis langsung (lebih cepat dari tick generator); titik yang di-gate follow CB tetap 0.
+async fn storm(inner: Arc<Inner>, points: Arc<Mutex<Vec<Live>>>, rate: u64, dur: Duration) {
+    let end = Instant::now() + dur;
+    let mut tick = tokio::time::interval(Duration::from_secs_f64(1.0 / rate as f64));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut rng = Rng::new(now_ms() ^ 0x5eed);
+    while Instant::now() < end {
+        tick.tick().await;
+        for p in lock(&points).iter_mut() {
+            let v = match p.p.init {
+                Val::Float(_) if p.p.gen.max > p.p.gen.min && p.p.gen.mode != Mode::Manual => {
+                    crate::behavior::Gen { mode: Mode::Random, ..p.p.gen.clone() }.next(p.own, 0.0, &mut rng)
+                }
+                Val::Float(_) => p.own * (0.9 + 0.2 * rng.f64()), // tanpa batas: ±10%
+                Val::Bool(_) if p.p.value_ref.starts_with("GGIO") => 1.0 - p.own,
+                _ => continue,
+            };
+            p.own = v;
+            if p.follow.as_ref().is_some_and(|f| inner.dbpos(f) != ffi::DBPOS_ON) {
+                continue;
+            }
+            inner.write(&p.attr, p.val(v), Some(&p.t));
+            p.cur = v;
+        }
+    }
+    inner.ctx.event(Ev::Scenario, "selesai badai data (durasi habis)".into());
 }
 
 pub fn now_ms() -> u64 {
@@ -1311,5 +1611,136 @@ mod tests {
 
         let manual = events.query(Some("UI"), Some(Ev::Manual), 20);
         assert_eq!(manual.len(), 7, "{manual:?}"); // hanya 7 perubahan yang berhasil
+    }
+
+    /// Fase 7: skenario trip, quality, hang, delay, putus, mati/hidup, badai.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn skenario() {
+        use std::io::{Read, Write};
+        let events = Arc::new(Events::new());
+        let rnd = Gen { mode: Mode::Random, interval_ms: 100, min: 100.0, max: 200.0, scale: 0.0, step: 1.0, period_s: 1.0 };
+        let cfg = IedConfig {
+            name: "SC".into(),
+            ld: "LD0".into(),
+            port: 10131,
+            components: vec![
+                comp("cb1", Kind::CircuitBreaker(Cb { travel_ms: 200, ..cb(1, true, CtlModel::SboEnhanced) })),
+                comp("prot1", Kind::Protection { class: model::ProtClass::Ptoc, inst: 1, cb: "cb1".into() }),
+                comp("ia", Kind::Telemetry { mx: Mx::preset("A", 1, "A").unwrap(), value: 150.0, gen: rnd, follow_cb: Some("cb1".into()) }),
+                comp("an", Kind::Telemetry { mx: Mx::preset("generic", 1, "1").unwrap(), value: 50.0, gen: Gen::manual(), follow_cb: None }),
+            ],
+        };
+        let ied = Ied::start(&cfg, Arc::clone(&events)).unwrap();
+        let live = |id: &str| ied.live_values().into_iter().find(|v| v["id"] == id).unwrap();
+        let sleep = |ms| tokio::time::sleep(Duration::from_millis(ms));
+        assert_eq!(ied.resolve("XCBR1").as_deref(), Some("cb1"));
+        assert_eq!(ied.resolve("MMXU1.A.phsA").as_deref(), Some("ia"));
+        assert_eq!(ied.resolve("PTOC1").as_deref(), Some("prot1"));
+
+        // trip: Str/Op naik, CB intermediate lalu open, arus ikut 0, Op turun setelah pulse
+        ied.run_scenario("trip", &json!({ "pulse_ms": 300 })).unwrap();
+        sleep(100).await;
+        assert_eq!(live("prot1")["op"], true);
+        assert_eq!(live("prot1")["str"], true);
+        assert_eq!(live("cb1")["pos"], "intermediate");
+        sleep(250).await;
+        assert_eq!(live("cb1")["pos"], "open");
+        assert_eq!(live("ia")["value"], 0.0);
+        sleep(150).await;
+        assert_eq!(live("prot1")["op"], false);
+        assert!(ied.run_scenario("trip", &json!({ "prot": "x" })).is_err());
+        // CB sudah open: hanya pulsa Op, Str tidak naik, Pos tetap
+        let m = ied.run_scenario("trip", &json!({})).unwrap();
+        assert!(m.contains("hanya pulsa Op"), "{m}");
+        sleep(100).await;
+        assert_eq!(live("prot1")["op"], true);
+        assert_eq!(live("prot1")["str"], false);
+        assert_eq!(live("cb1")["pos"], "open");
+        sleep(200).await;
+        assert_eq!(live("prot1")["op"], false);
+
+        // quality per komponen + normalkan
+        ied.run_scenario("quality", &json!({ "validity": "invalid", "flags": ["oldData"], "components": ["an"] })).unwrap();
+        assert_eq!(live("an")["q"]["text"], "invalid+oldData");
+        assert_eq!(live("cb1")["q"]["text"], "good");
+        assert_eq!(ied.info()["scenarios"]["quality"], "invalid+oldData");
+        assert!(ied.run_scenario("quality", &json!({ "flags": ["ngawur"] })).is_err());
+        let before = live("an")["value"].clone();
+        ied.stop_scenario("quality").unwrap();
+        assert_eq!(live("an")["q"]["text"], "good");
+        assert_eq!(live("an")["value"], before, "normalkan hanya mengubah quality");
+
+        // hang: TCP tetap terbuka, data ditahan, lalu diteruskan setelah lanjut
+        // COTP Connection Request (TPKT 22 byte); IED menjawab Connection Confirm
+        const CR: [u8; 22] = [3, 0, 0, 22, 17, 0xe0, 0, 0, 0, 1, 0, 0xc0, 1, 0x0a, 0xc2, 2, 0, 1, 0xc1, 2, 0, 1];
+        ied.run_scenario("hang", &json!({})).unwrap();
+        assert_eq!(ied.info()["status"], "hang");
+        let mut raw = std::thread::spawn(|| std::net::TcpStream::connect("127.0.0.1:10131").unwrap()).join().unwrap();
+        raw.set_read_timeout(Some(Duration::from_millis(400))).unwrap();
+        raw.write_all(&CR).unwrap();
+        let mut buf = [0u8; 64];
+        let mut r2 = raw.try_clone().unwrap();
+        assert!(std::thread::spawn(move || r2.read(&mut buf)).join().unwrap().is_err(), "selama hang tidak boleh ada jawaban");
+        ied.stop_scenario("hang").unwrap();
+        let n = std::thread::spawn(move || raw.read(&mut buf).map(|n| (n, buf[5]))).join().unwrap().unwrap();
+        assert_eq!(n.1, 0xd0, "setelah lanjut, Connection Confirm harus sampai (n={})", n.0);
+
+        // delay: asosiasi MMS (beberapa bolak-balik) jadi jauh lebih lama
+        let t = Instant::now();
+        drop(std::thread::spawn(|| Conn::connect("127.0.0.1", 10131).unwrap()).join().unwrap());
+        let normal = t.elapsed();
+        ied.run_scenario("delay", &json!({ "ms": 300 })).unwrap();
+        let t = Instant::now();
+        let c = std::thread::spawn(|| Conn::connect("127.0.0.1", 10131).unwrap()).join().unwrap();
+        assert!(t.elapsed() > normal + Duration::from_millis(500), "delay tidak terasa: {:?} vs {normal:?}", t.elapsed());
+        ied.stop_scenario("delay").unwrap();
+
+        // putus koneksi: client ditutup, IED tetap jalan
+        sleep(200).await;
+        assert!(ied.info()["client_count"].as_u64().unwrap() >= 1);
+        ied.run_scenario("disconnect", &json!({})).unwrap();
+        sleep(300).await;
+        assert_eq!(ied.info()["client_count"], 0);
+        drop(c);
+        // mode rst: client menerima RST (connection reset), bukan FIN (read = 0)
+        let mut raw = std::thread::spawn(|| std::net::TcpStream::connect("127.0.0.1:10131").unwrap()).join().unwrap();
+        sleep(200).await;
+        assert!(ied.run_scenario("disconnect", &json!({ "mode": "ngawur" })).is_err());
+        ied.run_scenario("disconnect", &json!({ "mode": "rst" })).unwrap();
+        sleep(200).await;
+        let mut b = [0u8; 8];
+        let e = std::thread::spawn(move || raw.read(&mut b)).join().unwrap();
+        assert_eq!(e.map_err(|e| e.kind()), Err(std::io::ErrorKind::ConnectionReset));
+
+        // clock: bit ClockNotSynchronized (0x20) / ClockFailure (0x40) di timestamp yang ditulis sesudahnya
+        let tq = || {
+            let a = ied.inner.attr("GGIO1.AnIn1.t").unwrap();
+            // SAFETY: attr valid, bertipe UtcTime
+            unsafe { ffi::MmsValue_getUtcTimeQuality(ffi::IedServer_getAttributeValue(ied.inner.server, a.0)) }
+        };
+        ied.run_scenario("clock", &json!({})).unwrap();
+        ied.set("an", &json!({ "value": 7.0 })).unwrap();
+        sleep(250).await;
+        assert_eq!(tq() & 0x60, 0x20, "ClockNotSynchronized");
+        ied.run_scenario("clock", &json!({ "failure": true, "not_sync": false })).unwrap();
+        ied.set("an", &json!({ "value": 8.0 })).unwrap();
+        sleep(250).await;
+        assert_eq!(tq() & 0x60, 0x40, "ClockFailure");
+        ied.stop_scenario("clock").unwrap();
+        ied.set("an", &json!({ "value": 50.0 })).unwrap();
+        sleep(250).await;
+        assert_eq!(tq() & 0x60, 0, "normal");
+
+        // badai: titik manual pun berubah, lalu berhenti sendiri
+        assert!(ied.run_scenario("storm", &json!({ "rate": 5000 })).is_err());
+        ied.run_scenario("storm", &json!({ "rate": 50, "duration": 1 })).unwrap();
+        assert!(ied.run_scenario("storm", &json!({})).is_err(), "badai kedua saat masih jalan");
+        sleep(400).await;
+        assert_ne!(live("an")["value"], 50.0);
+        assert_eq!(ied.info()["scenarios"]["storm"], true);
+        sleep(1000).await;
+        assert_eq!(ied.info()["scenarios"]["storm"], false);
+        let sc: Vec<String> = events.query(Some("SC"), Some(Ev::Scenario), 50).into_iter().map(|e| e.msg).collect();
+        assert!(sc.iter().any(|m| m.contains("badai data (durasi habis)")), "{sc:?}");
     }
 }

@@ -4,21 +4,21 @@ import { DndContext, closestCenter, type DragEndEvent } from '@dnd-kit/core';
 import { SortableContext, arrayMove, verticalListSortingStrategy } from '@dnd-kit/sortable';
 import { TbDragDrop } from 'react-icons/tb';
 import { MdOutlineCheck, MdArrowBack } from 'react-icons/md';
-import { toast } from 'sonner';
 import socket from '../socket';
-import type { Comp, IedInfo, SetCmd } from '../types';
+import type { Comp, EventLog, IedInfo, SetCmd } from '../types';
 import { Button, SortableItem } from '../ui';
-import { CircuitBreaker, TapChanger, TeleSignal, Telemetry } from '../components/Cards';
-
-type Ack = { ok: boolean; message: string };
+import { CircuitBreaker, Protection, TapChanger, TeleSignal, Telemetry } from '../components/Cards';
+import { ScenarioPanel } from '../components/ScenarioPanel';
+import { EventPanel } from '../components/EventPanel';
+import { runScenario, setValue, updateOrder } from '../api';
 
 const COLUMNS: { title: string; types: Comp['type'][] }[] = [
-  { title: 'Circuit Breakers & Tap Changers', types: ['cb', 'tap'] },
+  { title: 'CB, Tap Changer & Proteksi', types: ['cb', 'tap', 'protection'] },
   { title: 'Telesignals', types: ['telesignal'] },
   { title: 'Telemetries', types: ['telemetry'] },
 ];
 
-export function IedDetail({ name, info, back }: { name: string; info?: IedInfo; back: () => void }) {
+export function IedDetail({ name, info, back, events }: { name: string; info?: IedInfo; back: () => void; events: EventLog[] }) {
   const [comps, setComps] = useState<Comp[]>([]);
   const [dragging, setDragging] = useState(false);
 
@@ -41,8 +41,7 @@ export function IedDetail({ name, info, back }: { name: string; info?: IedInfo; 
     };
   }, [name]);
 
-  const send = (id: string) => (cmd: SetCmd) =>
-    socket.emit('set_value', { ied: name, id, ...cmd }, (r: Ack) => !r.ok && toast.error(r.message));
+  const send = (id: string) => (cmd: SetCmd) => setValue(name, id, cmd);
 
   // Drag di satu kolom: urutan kolom itu diganti, posisi kolom lain tetap
   const onDragEnd = (types: Comp['type'][]) => (e: DragEndEvent) => {
@@ -54,7 +53,7 @@ export function IedDetail({ name, info, back }: { name: string; info?: IedInfo; 
     let k = 0;
     const next = comps.map((c) => (types.includes(c.type) ? moved[k++] : c));
     setComps(next);
-    socket.emit('update_order', { ied: name, order: next.map((c) => c.id) }, (r: Ack) => !r.ok && toast.error(r.message));
+    updateOrder(name, next.map((c) => c.id));
   };
 
   return (
@@ -67,7 +66,8 @@ export function IedDetail({ name, info, back }: { name: string; info?: IedInfo; 
           <p className="text-xl font-bold">{name}</p>
           {info && (
             <span className="text-sm text-gray-600">
-              port {info.port} · {info.client_count} client · mode {info.mode}
+              <span className={info.status === 'running' ? '' : 'font-bold text-red-600'}>{info.status}</span> · port {info.port} · {info.client_count} client
+              · mode {info.mode}
               {info.rcbs.length > 0 && ` (${info.rcbs.map((r) => r.rcb).join(', ')})`}
             </span>
           )}
@@ -81,11 +81,18 @@ export function IedDetail({ name, info, back }: { name: string; info?: IedInfo; 
         </Button>
       </div>
 
+      <ScenarioPanel ied={name} info={info} prots={comps.filter((c) => c.type === 'protection').map((c) => c.id)} />
+      {info?.status === 'off' && (
+        <p className="px-4 py-1 bg-red-600 text-white text-sm font-bold">
+          IED mati: IedServer dihancurkan & port {info.port} ditutup. Klik Hidupkan untuk membuat ulang (buffer report kosong, nilai kembali ke awal).
+        </p>
+      )}
+
       <div className="flex flex-row w-full">
         {COLUMNS.map(({ title, types }) => {
           const items = comps.filter((c) => types.includes(c.type));
           return (
-            <div key={title} className="w-1/3 border-2 flex flex-col h-[calc(100vh-110px)]">
+            <div key={title} className="w-1/3 border-2 flex flex-col h-[calc(100vh-380px)] min-h-64">
               <div className="flex border-b-2 justify-center">
                 <h2 className="text-xl font-semibold m-2">{title}</h2>
               </div>
@@ -98,6 +105,7 @@ export function IedDetail({ name, info, back }: { name: string; info?: IedInfo; 
                         {c.type === 'tap' && <TapChanger c={c} send={send(c.id)} dragging={dragging} />}
                         {c.type === 'telesignal' && <TeleSignal c={c} send={send(c.id)} dragging={dragging} />}
                         {c.type === 'telemetry' && <Telemetry c={c} send={send(c.id)} dragging={dragging} />}
+                        {c.type === 'protection' && <Protection c={c} trip={() => runScenario(name, 'trip', { prot: c.id })} dragging={dragging} />}
                       </SortableItem>
                     ))}
                   </SortableContext>
@@ -108,6 +116,7 @@ export function IedDetail({ name, info, back }: { name: string; info?: IedInfo; 
           );
         })}
       </div>
+      <EventPanel events={events} ied={name} />
     </div>
   );
 }

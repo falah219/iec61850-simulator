@@ -22,6 +22,8 @@ pub enum Kind {
     Report,
     /// perubahan nilai manual dari UI / API
     Manual,
+    /// skenario mulai / selesai
+    Scenario,
 }
 
 impl Kind {
@@ -32,11 +34,12 @@ impl Kind {
             Self::Control => "control",
             Self::Report => "report",
             Self::Manual => "manual",
+            Self::Scenario => "scenario",
         }
     }
 
     pub fn parse(s: &str) -> Option<Self> {
-        [Self::Connection, Self::Rcb, Self::Control, Self::Report, Self::Manual].into_iter().find(|k| k.as_str() == s)
+        [Self::Connection, Self::Rcb, Self::Control, Self::Report, Self::Manual, Self::Scenario].into_iter().find(|k| k.as_str() == s)
     }
 }
 

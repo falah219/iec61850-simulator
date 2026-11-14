@@ -5,7 +5,10 @@ export type Quality = { raw: number; text: string };
 export type IedInfo = {
   name: string;
   port: number;
-  status: string;
+  /** off = skenario IED mati, hang = proxy menahan data */
+  status: 'running' | 'off' | 'hang';
+  delay_ms: number;
+  scenarios: { quality: string | null; clock: string | null; storm: boolean };
   components: number;
   client_count: number;
   clients: { addr: string; since: number }[];
@@ -56,7 +59,12 @@ export type TmComp = Base & {
   auto: boolean | null;
 };
 
-export type Comp = CbComp | TapComp | TsComp | TmComp;
+export type ProtComp = Base & { type: 'protection'; ln: string; cb: string; op: boolean; str: boolean };
+
+export type Comp = CbComp | TapComp | TsComp | TmComp | ProtComp;
+
+export type EventKind = 'connection' | 'rcb' | 'control' | 'report' | 'manual' | 'scenario';
+export type EventLog = { id: number; ts: number; ied: string; type: EventKind; msg: string };
 
 /** Perintah ubah manual (lihat backend Ied::set) */
 export type SetCmd = { action?: string; local?: boolean; auto?: boolean; value?: boolean | number };
