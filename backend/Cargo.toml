@@ -1,0 +1,22 @@
+[package]
+name = "iec61850-simulator"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+axum = "0.8"
+socketioxide = "0.15"
+tower-http = { version = "0.6", features = ["cors"] }
+tokio = { version = "1.42", features = ["full"] }
+serde_json = "1.0"
+dotenv = "0.15"
+# Logger: versi sama dengan fep-61850
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "chrono"] }
+tracing-appender = "0.2"
+
+[build-dependencies]
+bindgen = "0.73"
+
+[profile.release]
+lto = "thin"

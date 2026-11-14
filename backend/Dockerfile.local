@@ -1,0 +1,41 @@
+# syntax=docker/dockerfile:1
+# Backend simulator (pola sama dengan Dockerfile fep-61850): build libIEC61850 + Rust, lalu image kecil.
+
+FROM rust:slim-bookworm AS builder
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential cmake clang libclang-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# libIEC61850 v1.6.2.1 dari source di repo (lihat THIRD_PARTY_NOTICES.md), tanpa unduh dari internet.
+COPY native/libiec61850 /tmp/libiec61850
+RUN cmake -S /tmp/libiec61850 -B /tmp/libiec61850/build -DCMAKE_BUILD_TYPE=Release \
+        -DBUILD_EXAMPLES=OFF -DBUILD_TESTS=OFF -DCMAKE_INSTALL_PREFIX=/usr/local \
+    && cmake --build /tmp/libiec61850/build -j"$(nproc)" \
+    && cmake --install /tmp/libiec61850/build \
+    && rm -rf /tmp/libiec61850
+
+WORKDIR /srv/backend
+COPY Cargo.toml Cargo.lock build.rs wrapper.h ./
+COPY src ./src
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/srv/backend/target \
+    cargo build --release \
+    && cp target/release/iec61850-simulator /usr/local/bin/iec61850-simulator
+
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd -r appuser && useradd -r -g appuser -d /app appuser
+
+WORKDIR /app
+COPY --from=builder /usr/local/bin/iec61850-simulator /app/
+RUN chown -R appuser:appuser /app
+USER appuser
+
+EXPOSE 6061 102
+HEALTHCHECK --interval=10s --timeout=3s CMD curl -fs http://localhost:${HTTP_PORT:-6061}/health || exit 1
+CMD ["./iec61850-simulator"]

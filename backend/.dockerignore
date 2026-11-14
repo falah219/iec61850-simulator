@@ -1,0 +1,4 @@
+target/
+logs/
+.env
+native/libiec61850/build/

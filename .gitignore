@@ -1,0 +1,10 @@
+# Rust
+backend/target/
+# Node
+node_modules/
+dist/
+# Log & env asli (yang di-commit hanya .env.example)
+logs/
+*.log
+.env
+.DS_Store
