@@ -348,7 +348,10 @@ impl View {
             },
             _ => unreachable!("refs() sesuai kind"),
         };
-        Ok(Self { id: c.id.clone(), desc: c.describe(), kind, qs })
+        let mut desc = c.describe();
+        // bentuk konfigurasi (JSON export/import), dipakai dialog ubah komponen di UI
+        desc["config"] = serde_json::to_value(c).map_err(|e| e.to_string())?;
+        Ok(Self { id: c.id.clone(), desc, kind, qs })
     }
 }
 
@@ -768,7 +771,13 @@ impl Ied {
         let points = Arc::new(Mutex::new(live));
         let task = Mutex::new(Some(tokio::spawn(generate(Arc::clone(&inner), Arc::clone(&points)))));
         let proxy = Mutex::new(Some(tokio::spawn(proxy::run(public, internal, Arc::clone(&ctx)))));
-        let order = Mutex::new(views.iter().map(|v| v.id.clone()).collect());
+        let ids: Vec<String> = views.iter().map(|v| v.id.clone()).collect();
+        let mut saved = cfg.order.clone();
+        saved.sort();
+        let mut sorted = ids.clone();
+        sorted.sort();
+        // urutan tersimpan dipakai kalau masih cocok dengan komponen sekarang
+        let order = Mutex::new(if saved == sorted { cfg.order.clone() } else { ids });
         let (scen, storm) = (Mutex::new((None, None)), Mutex::new(None));
         Ok(Self { name: cfg.name.clone(), port: cfg.port, ctx, inner, points, views, order, scen, proxy, task, storm })
     }
@@ -1337,6 +1346,7 @@ mod tests {
                 comp("ia", Kind::Telemetry { mx: Mx::preset("A", 1, "A").unwrap(), value: 15.0, gen: fast(Mode::Sine), follow_cb: Some("cb2".into()) }),
                 comp("an", Kind::Telemetry { mx: Mx::preset("generic", 1, "3").unwrap(), value: 1.5, gen: Gen::manual(), follow_cb: None }),
             ],
+            ..Default::default()
         };
         let ied = Ied::start(&cfg, Arc::new(Events::new())).expect("start");
         assert!(Ied::start(&cfg, Arc::new(Events::new())).is_err(), "port sama tidak boleh dipakai dua kali");
@@ -1379,6 +1389,7 @@ mod tests {
                 comp("tap1", tap(1, false, 100_000)),
                 comp("tap2", tap(2, true, 100)),
             ],
+            ..Default::default()
         };
         let ied = Ied::start(&cfg, Arc::new(Events::new())).expect("start");
         let wait = Duration::from_secs(3);
@@ -1487,6 +1498,7 @@ mod tests {
                 comp("cb1", Kind::CircuitBreaker(cb(1, true, CtlModel::SboEnhanced))),
                 comp("mw", Kind::Telemetry { mx: Mx::preset("MW", 1, "").unwrap(), value: 0.0, gen: fast.clone(), follow_cb: None }),
             ],
+            ..Default::default()
         };
         let ieds: Vec<Ied> =
             [("MA", 10111), ("MB", 10112), ("MC", 10113)].iter().map(|(n, p)| Ied::start(&ied(n, *p), Arc::clone(&events)).unwrap()).collect();
@@ -1568,6 +1580,7 @@ mod tests {
                 comp("ts1", Kind::Telesignal { ggio: 1, ind: 1, value: false, gen: Gen::manual() }),
                 comp("mw", Kind::Telemetry { mx: Mx::preset("MW", 1, "").unwrap(), value: 15.0, gen: rnd, follow_cb: None }),
             ],
+            ..Default::default()
         };
         let ied = Ied::start(&cfg, Arc::clone(&events)).unwrap();
         let live = |id: &str| ied.live_values().into_iter().find(|v| v["id"] == id).unwrap();
@@ -1629,6 +1642,7 @@ mod tests {
                 comp("ia", Kind::Telemetry { mx: Mx::preset("A", 1, "A").unwrap(), value: 150.0, gen: rnd, follow_cb: Some("cb1".into()) }),
                 comp("an", Kind::Telemetry { mx: Mx::preset("generic", 1, "1").unwrap(), value: 50.0, gen: Gen::manual(), follow_cb: None }),
             ],
+            ..Default::default()
         };
         let ied = Ied::start(&cfg, Arc::clone(&events)).unwrap();
         let live = |id: &str| ied.live_values().into_iter().find(|v| v["id"] == id).unwrap();

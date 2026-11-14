@@ -21,7 +21,8 @@ export type IedInfo = {
 
 export type Gen = { mode: string; interval_ms: number; min: number; max: number; scale: number };
 
-type Base = { id: string; q: Quality; t: number };
+/** config = bentuk JSON komponen (export/import), dipakai dialog ubah */
+type Base = { id: string; q: Quality; t: number; config: Record<string, unknown> };
 
 export type CbComp = Base & {
   type: 'cb';

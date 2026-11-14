@@ -16,6 +16,9 @@ services:
       - HTTP_PORT=6061
       - MMS_PORT=102
       - MMS_PORT_BASE=10102
+      - AUTOSAVE_PATH=/data/simulator.json   # konfigurasi bertahan setelah container restart
+    volumes:
+      - simulator-data:/data
 
   frontend:
     build:
@@ -28,3 +31,6 @@ services:
       - "4061:4061"
     depends_on:
       - backend
+
+volumes:
+  simulator-data:

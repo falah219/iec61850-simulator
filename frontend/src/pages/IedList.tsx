@@ -1,7 +1,12 @@
 // Halaman Daftar IED (PLAN 8.1): status, client terhubung, mode report/polling, kejadian terakhir.
+import { useState } from 'react';
+import { MdAdd, MdDeleteOutline, MdOutlineEdit } from 'react-icons/md';
+import { CgImport } from 'react-icons/cg';
+import { PiExportBold } from 'react-icons/pi';
 import type { IedInfo } from '../types';
 import { Button, fmtTime } from '../ui';
-import { runScenario, stopScenario } from '../api';
+import { call, exportFile, importFile, runScenario, stopScenario } from '../api';
+import { IedDialog } from '../components/IedDialog';
 
 const STATUS = {
   running: 'bg-green-100 text-green-800 border-green-600',
@@ -19,11 +24,26 @@ const MODE = {
 
 export function IedList({ ieds, open }: { ieds: IedInfo[]; open: (name: string) => void }) {
   const clients = ieds.reduce((n, i) => n + i.client_count, 0);
+  // undefined = tidak ada dialog, null = tambah IED, IedInfo = ubah
+  const [dialog, setDialog] = useState<IedInfo | null | undefined>(undefined);
+  const remove = (name: string) => confirm(`Hapus ${name}? IED dimatikan dan konfigurasinya dibuang.`) && call('remove_ied', { ied: name });
   return (
     <div className="p-4 overflow-auto h-[calc(100vh-60px)]">
-      <p className="mb-3 text-sm text-gray-600">
-        {ieds.length} IED, {clients} client terhubung
-      </p>
+      <div className="mb-3 flex items-center gap-2">
+        <p className="text-sm text-gray-600 mr-auto">
+          {ieds.length} IED, {clients} client terhubung
+        </p>
+        <Button className="px-3 h-9 bg-white hover:bg-gray-300" onClick={() => setDialog(null)} title="Tambah IED (satu / banyak dari template)">
+          <MdAdd /> Tambah IED
+        </Button>
+        <Button className="px-3 h-9 bg-white hover:bg-gray-300" onClick={() => exportFile()} title="Export konfigurasi semua IED (JSON)">
+          <PiExportBold /> Export
+        </Button>
+        <Button className="px-3 h-9 bg-white hover:bg-gray-300" onClick={() => importFile()} title="Import: semua IED diganti isi file">
+          <CgImport /> Import
+        </Button>
+      </div>
+      {dialog !== undefined && <IedDialog ied={dialog ?? undefined} ieds={ieds} onClose={() => setDialog(undefined)} />}
       <table className="w-full text-sm border-2 border-black">
         <thead className="bg-gray-100 border-b-2 border-black text-left">
           <tr>
@@ -94,6 +114,12 @@ export function IedList({ ieds, open }: { ieds: IedInfo[]; open: (name: string) 
                     )}
                     <Button className={small} disabled={i.status === 'off' || i.client_count === 0} onClick={() => runScenario(i.name, 'disconnect')}>
                       Putus
+                    </Button>
+                    <Button className={small} onClick={() => setDialog(i)} title="Ubah nama / LD / port">
+                      <MdOutlineEdit />
+                    </Button>
+                    <Button className={`${small} text-red-600`} onClick={() => remove(i.name)} title="Hapus IED">
+                      <MdDeleteOutline />
                     </Button>
                   </div>
                 </td>

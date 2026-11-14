@@ -40,6 +40,53 @@ Socket.IO dari UI: `subscribe_ied` / `unsubscribe_ied` (room per IED), `set_valu
 (hasil lewat ack `{ok, message}`), `get_initial_data`. Ke UI: `ieds`, `components` (config + nilai),
 `value_changed` (hanya yang berubah, tiap 300 ms, hanya ke room IED itu), `event_log`, `error`.
 
+## Konfigurasi: tambah / ubah / hapus, export / import, autosave
+
+- **Daftar IED**: *Tambah IED* (satu, atau banyak sekaligus dengan komponen disalin dari IED lain
+  sebagai template; nama `SIMIED<n>` & port bebas berikutnya otomatis), ubah nama / LD / port, hapus,
+  *Export* / *Import* semua IED.
+- **Detail IED**: `+` tambah komponen, tombol pensil = mode edit (ubah / hapus di tiap kartu),
+  export / import komponen IED itu.
+- Model IEC 61850 tidak bisa diubah saat server jalan, jadi **IED yang modelnya berubah restart
+  otomatis** (client terputus, nilai kembali ke awal); IED lain tidak terganggu. Urutan kartu tidak memicu restart.
+- Validasi dulu: kalau ditolak (id/nomor/port bentrok, CB masih dipakai follow_cb / proteksi, dll.)
+  tidak ada yang berubah.
+- **Nomor otomatis tidak dipakai ulang**: instance CB (XCBR/CSWI), Tap (YLTC/ATCC), Proteksi (PTOC/PDIS),
+  `Ind<k>` & `AnIn<k>` per GGIO diambil dari penghitung per IED (`counters` di JSON) yang tidak pernah
+  turun. Hapus CB2 lalu tambah CB baru -> XCBR3. Nomor instance MMXU / GGIO dipilih tester.
+- **Autosave** (`AUTOSAVE_PATH`, di docker compose `/data/simulator.json` di volume `simulator-data`):
+  disimpan tiap perubahan; saat start file dimuat (IED_COUNT diabaikan). Mulai dari nol:
+  `docker compose down -v`.
+- Import semua IED = konfigurasi lama diganti; import di detail IED = komponen IED itu diganti
+  (nama / LD / port tetap).
+
+Format JSON (sama untuk export, import, autosave):
+
+```json
+{ "version": 1, "ieds": [ { "name": "SIMIED1", "ld": "LD0", "port": 102,
+  "counters": { "XCBR": 2, "GGIO1.Ind": 2 }, "order": [],
+  "components": [
+    { "id": "cb1", "type": "cb", "inst": 1, "closed": true, "ctl_model": "sbo-enhanced", "travel_ms": 100,
+      "local": false, "interlock": false, "accept_same": false, "sbo_timeout_ms": 30000 },
+    { "id": "tap1", "type": "tap", "inst": 1, "pos": 9, "min": 1, "max": 17, "ctl_model": "direct-enhanced", "interval_ms": 5000 },
+    { "id": "ts1", "type": "telesignal", "ggio": 1, "ind": 1, "value": true, "gen": { "mode": "toggle", "interval_ms": 5000 } },
+    { "id": "mw", "type": "telemetry", "mx": { "class": "MMXU", "inst": 1, "do": "TotW", "phase": null }, "value": 50,
+      "gen": { "mode": "random_walk", "interval_ms": 1000, "min": 0, "max": 100, "scale": 0.1, "step": 5 }, "follow_cb": "cb1" },
+    { "id": "prot1", "type": "protection", "class": "PTOC", "inst": 1, "cb": "cb1" }
+  ] } ] }
+```
+
+Nomor `inst` / `ind` 0 atau tidak diisi = otomatis; `"do": "AnIn"` tanpa angka = AnIn otomatis.
+
+| HTTP | Fungsi |
+|---|---|
+| `GET /export[?ied=SIMIED1]` | konfigurasi semua IED / satu IED |
+| `POST /import[?ied=SIMIED1]` | body file JSON di atas |
+
+Socket.IO: `add_ied {name?, ld?, port?, template?, count?}`, `update_ied {ied, name?, ld?, port?}`,
+`remove_ied {ied}`, `add_component {ied, component}`, `update_component {ied, id, component}`,
+`remove_component {ied, id}`, `export_data {ied?}` (ack `{ok, data}`), `import_data {data, ied?}`.
+
 ## Skenario (UI + HTTP API)
 
 Di UI: panel **Skenario** di detail IED (+ tombol cepat Mati / Hang / Putus di daftar IED), hasil
@@ -97,7 +144,7 @@ Socket.IO: `ieds` (dikirim saat terhubung dan setiap ada perubahan, maks 1x/deti
 (200 kejadian terakhir saat terhubung, lalu real-time). Semua kejadian juga ditulis ke log backend
 (`report` di level debug).
 
-## Isi IED contoh (sementara di kode, `backend/src/main.rs`, sama untuk semua IED)
+## Isi IED contoh (`backend/src/main.rs`; dipakai saat belum ada file autosave)
 
 | Komponen | Reference | Generator |
 |---|---|---|

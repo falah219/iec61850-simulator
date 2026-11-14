@@ -12,27 +12,54 @@
 //! Dataset `LLN0.DS_ST` (semua titik ST) & `LLN0.DS_MX` (semua titik MX), masing-masing dengan
 //! BRCB `brcb<ST|MX>01..02` dan URCB `urcb<ST|MX>01..02`.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
+
+use serde::{Deserialize, Serialize};
 use std::ffi::CString;
 use std::ptr;
 
 use crate::behavior::{Gen, Mode};
 use crate::ffi;
 
+/// Konfigurasi satu IED; juga format export/import/autosave (JSON).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct IedConfig {
     pub name: String,
+    #[serde(default = "default_ld")]
     pub ld: String,
     pub port: u16,
+    #[serde(default)]
     pub components: Vec<Component>,
+    /// Penghitung nomor otomatis (high-water mark), mis. `XCBR`, `GGIO1.Ind`. Tidak pernah turun,
+    /// jadi nomor komponen yang dihapus tidak dipakai ulang. Lihat [`allocate`].
+    #[serde(default)]
+    pub counters: BTreeMap<String, u32>,
+    /// Urutan kartu di UI (id komponen); kosong = urutan `components`
+    #[serde(default)]
+    pub order: Vec<String>,
 }
 
+fn default_ld() -> String {
+    "LD0".into()
+}
+
+/// File export / import / autosave
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SaveFile {
+    pub version: u32,
+    pub ieds: Vec<IedConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Component {
     pub id: String,
+    #[serde(flatten)]
     pub kind: Kind,
 }
 
 /// ctlModel IEC 61850-7-3 (nilainya sama dengan enum di standar).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum CtlModel {
     StatusOnly = 0,
     DirectNormal = 1,
@@ -66,12 +93,14 @@ impl CtlModel {
     }
 }
 
-/// Circuit Breaker: `XCBR<inst>` + `CSWI<inst>`.
-#[derive(Debug, Clone)]
+/// Circuit Breaker: `XCBR<inst>` + `CSWI<inst>`. Field yang tidak ada di JSON memakai default.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Cb {
-    /// Nomor instance LN, dikunci per komponen (tidak bergeser saat komponen lain dihapus)
+    /// Nomor instance LN, dikunci per komponen (0 = diisi otomatis, lihat [`allocate`])
     pub inst: u32,
     pub closed: bool,
+    #[serde(rename = "ctl_model")]
     pub ctl: CtlModel,
     /// Lama di posisi intermediate saat operate
     pub travel_ms: u64,
@@ -88,7 +117,7 @@ pub struct Cb {
 impl Default for Cb {
     fn default() -> Self {
         Self {
-            inst: 1,
+            inst: 0,
             closed: false,
             ctl: CtlModel::SboEnhanced,
             travel_ms: 100,
@@ -100,26 +129,65 @@ impl Default for Cb {
     }
 }
 
+/// `type` di JSON: cb / tap / telesignal / telemetry / protection. Nomor 0 = diisi otomatis.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum Kind {
+    #[serde(rename = "cb")]
     CircuitBreaker(Cb),
     /// `YLTC<inst>` + `ATCC<inst>`. Posisi tap `min..=max` (posVal INT8: -64..63). `auto`: ATCC.Auto awal;
     /// saat auto, tap bergerak 1 langkah tiap `interval_ms` (berbalik arah di batas) dan raise/lower
     /// ditolak (blocked-by-mode).
-    TapChanger { inst: u32, pos: i32, min: i32, max: i32, ctl: CtlModel, local: bool, auto: bool, interval_ms: u64 },
+    #[serde(rename = "tap")]
+    TapChanger {
+        #[serde(default)]
+        inst: u32,
+        pos: i32,
+        min: i32,
+        max: i32,
+        #[serde(rename = "ctl_model")]
+        ctl: CtlModel,
+        #[serde(default)]
+        local: bool,
+        #[serde(default)]
+        auto: bool,
+        interval_ms: u64,
+    },
     /// `GGIO<ggio>.Ind<ind>`; mode: manual / toggle. Nomor dikunci per komponen.
-    Telesignal { ggio: u32, ind: u32, value: bool, gen: Gen },
+    Telesignal {
+        ggio: u32,
+        #[serde(default)]
+        ind: u32,
+        #[serde(default)]
+        value: bool,
+        #[serde(default)]
+        gen: Gen,
+    },
     /// `follow_cb`: id CB; nilai jadi 0 selama CB tidak close (mis. arus saat CB open)
-    Telemetry { mx: Mx, value: f64, gen: Gen, follow_cb: Option<String> },
+    Telemetry {
+        mx: Mx,
+        #[serde(default)]
+        value: f64,
+        #[serde(default)]
+        gen: Gen,
+        #[serde(default)]
+        follow_cb: Option<String>,
+    },
     /// `PTOC<inst>` / `PDIS<inst>`: Op (ACT) + Str (ACD). Skenario trip membuka CB `cb` (id komponen CB).
-    Protection { class: ProtClass, inst: u32, cb: String },
+    Protection {
+        class: ProtClass,
+        #[serde(default)]
+        inst: u32,
+        cb: String,
+    },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "UPPERCASE")]
 pub enum ProtClass {
     /// arus lebih
     Ptoc,
     /// jarak (distance)
-    #[allow(dead_code)] // dipilih saat tambah komponen dari UI (fase 8)
     Pdis,
 }
 
@@ -132,18 +200,21 @@ impl ProtClass {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "UPPERCASE")]
 pub enum LnClass {
     Mmxu,
     Ggio,
 }
 
-/// Lokasi titik telemetry: `<class><inst>.<do_name>[.<phase>]`.
-#[derive(Debug, Clone, PartialEq)]
+/// Lokasi titik telemetry: `<class><inst>.<do_name>[.<phase>]`. GGIO `AnIn` tanpa angka = diisi otomatis.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Mx {
     pub class: LnClass,
     pub inst: u32,
+    #[serde(rename = "do")]
     pub do_name: String,
+    #[serde(default)]
     /// Sub-DO fasa untuk WYE/DEL, mis. `phsA`, `phsAB`
     pub phase: Option<String>,
 }
@@ -257,6 +328,74 @@ pub fn validate_all(cfgs: &[IedConfig]) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+impl Component {
+    /// Nomor otomatis komponen ini: (kunci penghitung, nomor). None = nomornya dipilih tester (MMXU).
+    pub fn number(&self) -> Option<(String, u32)> {
+        match &self.kind {
+            Kind::CircuitBreaker(cb) => Some(("XCBR".into(), cb.inst)),
+            Kind::TapChanger { inst, .. } => Some(("YLTC".into(), *inst)),
+            Kind::Protection { class, inst, .. } => Some((class.ln(0).trim_end_matches('0').into(), *inst)),
+            Kind::Telesignal { ggio, ind, .. } => Some((format!("GGIO{ggio}.Ind"), *ind)),
+            Kind::Telemetry { mx, .. } if mx.class == LnClass::Ggio => {
+                let k = mx.do_name.strip_prefix("AnIn")?;
+                Some((format!("GGIO{}.AnIn", mx.inst), k.parse().unwrap_or(0)))
+            }
+            Kind::Telemetry { .. } => None,
+        }
+    }
+
+    fn set_number(&mut self, n: u32) {
+        match &mut self.kind {
+            Kind::CircuitBreaker(cb) => cb.inst = n,
+            Kind::TapChanger { inst, .. } | Kind::Protection { inst, .. } => *inst = n,
+            Kind::Telesignal { ind, .. } => *ind = n,
+            Kind::Telemetry { mx, .. } => mx.do_name = format!("AnIn{n}"),
+        }
+    }
+
+    pub fn type_name(&self) -> &'static str {
+        match &self.kind {
+            Kind::CircuitBreaker(_) => "cb",
+            Kind::TapChanger { .. } => "tap",
+            Kind::Telesignal { .. } => "telesignal",
+            Kind::Telemetry { .. } => "telemetry",
+            Kind::Protection { .. } => "protection",
+        }
+    }
+}
+
+/// Nomor otomatis: penghitung dinaikkan ke nomor tertinggi yang ada, lalu nomor 0 diisi
+/// penghitung + 1. Penghitung tidak pernah turun, jadi nomor bekas komponen yang dihapus
+/// tidak dipakai ulang (keputusan fase 3).
+pub fn allocate(cfg: &mut IedConfig) {
+    for c in &cfg.components {
+        if let Some((k, n)) = c.number() {
+            let e = cfg.counters.entry(k).or_insert(0);
+            *e = (*e).max(n);
+        }
+    }
+    for c in &mut cfg.components {
+        if let Some((k, 0)) = c.number() {
+            let e = cfg.counters.entry(k).or_insert(0);
+            *e += 1;
+            c.set_number(*e);
+        }
+    }
+}
+
+/// Komponen baru menggantikan `old` (ubah dari UI): nomor dikunci, kecuali LN-nya pindah
+/// (mis. telesignal ke GGIO lain, proteksi PTOC -> PDIS) -> nomor baru dari penghitung.
+pub fn keep_number(old: &Component, new: &mut Component) {
+    if let (Some((ko, no)), Some((kn, _))) = (old.number(), new.number()) {
+        new.set_number(if ko == kn { no } else { 0 });
+    }
+}
+
+/// Model IEC 61850 sama (tidak perlu restart): urutan kartu & penghitung tidak memengaruhi model.
+pub fn same_model(a: &IedConfig, b: &IedConfig) -> bool {
+    a.name == b.name && a.ld == b.ld && a.port == b.port && a.components == b.components
 }
 
 /// Validasi satu IED (keunikan antar IED: [`validate_all`]).
@@ -753,7 +892,7 @@ mod tests {
     use super::*;
 
     fn cfg(components: Vec<Component>) -> IedConfig {
-        IedConfig { name: "SIMIED1".into(), ld: "LD0".into(), port: 102, components }
+        IedConfig { name: "SIMIED1".into(), ld: "LD0".into(), port: 102, components, ..Default::default() }
     }
 
     fn tm(id: &str, mx: Mx) -> Component {
@@ -791,10 +930,10 @@ mod tests {
     fn validasi_nama_dan_duplikat() {
         assert!(validate(&cfg(vec![])).is_ok());
         for (name, ld) in [("1IED", "LD0"), ("SIM-1", "LD0"), ("SIM1", "_LD"), ("", "LD0"), (&"A".repeat(30)[..], "LD0")] {
-            let c = IedConfig { name: name.into(), ld: ld.into(), port: 102, components: vec![] };
+            let c = IedConfig { name: name.into(), ld: ld.into(), port: 102, components: vec![], ..Default::default() };
             assert!(validate(&c).is_err(), "{name}{ld} harus ditolak");
         }
-        let c = IedConfig { name: "A".repeat(29), ld: "LD0".into(), port: 102, components: vec![] };
+        let c = IedConfig { name: "A".repeat(29), ld: "LD0".into(), port: 102, components: vec![], ..Default::default() };
         assert!(validate(&c).is_ok()); // pas 32
 
         let dup = cfg(vec![tm("a", Mx::preset("kV", 1, "A").unwrap()), tm("b", Mx::preset("kV", 1, "A").unwrap())]);
@@ -817,10 +956,49 @@ mod tests {
 
     #[test]
     fn nama_dan_port_unik_antar_ied() {
-        let ied = |name: &str, port| IedConfig { name: name.into(), ld: "LD0".into(), port, components: vec![] };
+        let ied = |name: &str, port| IedConfig { name: name.into(), ld: "LD0".into(), port, components: vec![], ..Default::default() };
         assert!(validate_all(&[ied("SIMIED1", 102), ied("SIMIED2", 10102)]).is_ok());
         assert!(validate_all(&[ied("SIMIED1", 102), ied("SIMIED1", 10102)]).unwrap_err().contains("nama IED"));
         assert!(validate_all(&[ied("SIMIED1", 102), ied("SIMIED2", 102)]).unwrap_err().contains("port MMS"));
+    }
+
+    #[test]
+    fn nomor_otomatis_tidak_dipakai_ulang() {
+        let k = |id: &str, kind| Component { id: id.into(), kind };
+        let cbk = |inst| Kind::CircuitBreaker(Cb { inst, ..Cb::default() });
+        let ts = |ggio, ind| Kind::Telesignal { ggio, ind, value: false, gen: Gen::manual() };
+        let an = |inst, d: &str| Kind::Telemetry {
+            mx: Mx { class: LnClass::Ggio, inst, do_name: d.into(), phase: None },
+            value: 0.0,
+            gen: Gen::manual(),
+            follow_cb: None,
+        };
+        let mut c = cfg(vec![k("a", cbk(0)), k("b", cbk(0)), k("t", ts(1, 0)), k("g", an(2, "AnIn"))]);
+        allocate(&mut c);
+        assert_eq!(c.components[1].number(), Some(("XCBR".into(), 2)));
+        assert_eq!(c.components[3].number(), Some(("GGIO2.AnIn".into(), 1)));
+        // hapus CB2, tambah CB baru -> 3 (bukan 2)
+        c.components.remove(1);
+        c.components.push(k("c", cbk(0)));
+        allocate(&mut c);
+        assert_eq!(c.components.last().unwrap().number(), Some(("XCBR".into(), 3)));
+        // file lama tanpa counters: penghitung ikut nomor tertinggi yang ada
+        let mut d = cfg(vec![k("a", cbk(7)), k("b", cbk(0))]);
+        allocate(&mut d);
+        assert_eq!(d.components[1].number(), Some(("XCBR".into(), 8)));
+        // ubah: nomor dikunci; pindah GGIO -> nomor baru
+        let mut moved = k("t", ts(3, 1));
+        keep_number(&c.components[1], &mut moved);
+        assert_eq!(moved.number(), Some(("GGIO3.Ind".into(), 0)));
+        let mut same = k("a", cbk(0));
+        keep_number(&c.components[0], &mut same);
+        assert_eq!(same.number(), Some(("XCBR".into(), 1)));
+        // JSON bolak-balik
+        let j = serde_json::to_string(&c).unwrap();
+        assert!(j.contains(r#""type":"cb""#) && j.contains(r#""ctl_model":"sbo-enhanced""#), "{j}");
+        assert_eq!(serde_json::from_str::<IedConfig>(&j).unwrap(), c);
+        let minimal: Component = serde_json::from_str(r#"{"id":"x","type":"cb"}"#).unwrap();
+        assert_eq!(minimal.kind, cbk(0));
     }
 
     #[test]

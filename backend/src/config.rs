@@ -16,6 +16,8 @@ pub struct Config {
     pub mms_port: u16,
     /// Port MMS IED ke-2 dst: base, base+1, ... (default 10102)
     pub mms_port_base: u16,
+    /// File JSON konfigurasi (dimuat saat start, disimpan tiap perubahan). None = tanpa autosave
+    pub autosave: Option<String>,
 }
 
 impl Config {
@@ -31,6 +33,7 @@ impl Config {
             ld_name: env::var("LD_NAME").unwrap_or_else(|_| "LD0".into()),
             mms_port: num("MMS_PORT", 102)?,
             mms_port_base: num("MMS_PORT_BASE", 10102)?,
+            autosave: env::var("AUTOSAVE_PATH").ok().filter(|p| !p.trim().is_empty()),
         };
         if c.ied_count == 0 {
             return Err("IED_COUNT minimal 1".into());

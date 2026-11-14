@@ -3,14 +3,17 @@ import { useEffect, useState } from 'react';
 import { DndContext, closestCenter, type DragEndEvent } from '@dnd-kit/core';
 import { SortableContext, arrayMove, verticalListSortingStrategy } from '@dnd-kit/sortable';
 import { TbDragDrop } from 'react-icons/tb';
-import { MdOutlineCheck, MdArrowBack } from 'react-icons/md';
+import { MdOutlineCheck, MdArrowBack, MdAdd, MdOutlineModeEditOutline, MdOutlineEdit, MdDeleteOutline } from 'react-icons/md';
+import { CgImport } from 'react-icons/cg';
+import { PiExportBold } from 'react-icons/pi';
+import { ComponentDialog } from '../components/ComponentDialog';
 import socket from '../socket';
 import type { Comp, EventLog, IedInfo, SetCmd } from '../types';
 import { Button, SortableItem } from '../ui';
 import { CircuitBreaker, Protection, TapChanger, TeleSignal, Telemetry } from '../components/Cards';
 import { ScenarioPanel } from '../components/ScenarioPanel';
 import { EventPanel } from '../components/EventPanel';
-import { runScenario, setValue, updateOrder } from '../api';
+import { call, exportFile, importFile, runScenario, setValue, updateOrder } from '../api';
 
 const COLUMNS: { title: string; types: Comp['type'][] }[] = [
   { title: 'CB, Tap Changer & Proteksi', types: ['cb', 'tap', 'protection'] },
@@ -21,6 +24,10 @@ const COLUMNS: { title: string; types: Comp['type'][] }[] = [
 export function IedDetail({ name, info, back, events }: { name: string; info?: IedInfo; back: () => void; events: EventLog[] }) {
   const [comps, setComps] = useState<Comp[]>([]);
   const [dragging, setDragging] = useState(false);
+  const [editing, setEditing] = useState(false);
+  // undefined = tidak ada dialog, null = tambah komponen, Comp = ubah
+  const [dialog, setDialog] = useState<Comp | null | undefined>(undefined);
+  const remove = (id: string) => confirm(`Hapus ${id}? ${name} akan restart (client terputus).`) && call('remove_component', { ied: name, id });
 
   useEffect(() => {
     const subscribe = () => socket.emit('subscribe_ied', { ied: name });
@@ -72,14 +79,35 @@ export function IedDetail({ name, info, back, events }: { name: string; info?: I
             </span>
           )}
         </div>
-        <Button
-          className={`px-2 h-8 ${dragging ? 'bg-blue-400' : 'bg-white hover:bg-gray-300'}`}
-          onClick={() => setDragging(!dragging)}
-          title={dragging ? 'Selesai' : 'Mode drag and drop (atur urutan kartu)'}
-        >
-          {dragging ? <MdOutlineCheck /> : <TbDragDrop />}
-        </Button>
+        <div className="flex gap-2">
+          <Button className="px-2 h-8 bg-white hover:bg-gray-300" disabled={dragging} onClick={() => setDialog(null)} title="Tambah komponen">
+            <MdAdd />
+          </Button>
+          <Button
+            className={`px-2 h-8 ${editing ? 'bg-blue-400' : 'bg-white hover:bg-gray-300'}`}
+            disabled={dragging}
+            onClick={() => setEditing(!editing)}
+            title={editing ? 'Selesai' : 'Mode edit (ubah / hapus komponen)'}
+          >
+            {editing ? <MdOutlineCheck /> : <MdOutlineModeEditOutline />}
+          </Button>
+          <Button
+            className={`px-2 h-8 ${dragging ? 'bg-blue-400' : 'bg-white hover:bg-gray-300'}`}
+            disabled={editing}
+            onClick={() => setDragging(!dragging)}
+            title={dragging ? 'Selesai' : 'Mode drag and drop (atur urutan kartu)'}
+          >
+            {dragging ? <MdOutlineCheck /> : <TbDragDrop />}
+          </Button>
+          <Button className="px-2 h-8 bg-white hover:bg-gray-300" onClick={() => exportFile(name)} title={`Export komponen ${name} (JSON)`}>
+            <PiExportBold />
+          </Button>
+          <Button className="px-2 h-8 bg-white hover:bg-gray-300" onClick={() => importFile(name)} title={`Import: komponen ${name} diganti isi file`}>
+            <CgImport />
+          </Button>
+        </div>
       </div>
+      {dialog !== undefined && <ComponentDialog ied={name} comp={dialog ?? undefined} comps={comps} onClose={() => setDialog(undefined)} />}
 
       <ScenarioPanel ied={name} info={info} prots={comps.filter((c) => c.type === 'protection').map((c) => c.id)} />
       {info?.status === 'off' && (
@@ -101,11 +129,23 @@ export function IedDetail({ name, info, back, events }: { name: string; info?: I
                   <SortableContext items={items.map((c) => c.id)} strategy={verticalListSortingStrategy}>
                     {items.map((c) => (
                       <SortableItem key={c.id} id={c.id} enabled={dragging}>
+                        <div className="relative">
+                        {editing && (
+                          <div className="absolute top-1 right-1 z-10 flex gap-1">
+                            <Button className="w-8 h-8 bg-white text-blue-600 hover:bg-gray-200" onClick={() => setDialog(c)} title={`Ubah ${c.id}`}>
+                              <MdOutlineEdit />
+                            </Button>
+                            <Button className="w-8 h-8 bg-white text-red-600 hover:bg-gray-200" onClick={() => remove(c.id)} title={`Hapus ${c.id}`}>
+                              <MdDeleteOutline />
+                            </Button>
+                          </div>
+                        )}
                         {c.type === 'cb' && <CircuitBreaker c={c} send={send(c.id)} dragging={dragging} />}
                         {c.type === 'tap' && <TapChanger c={c} send={send(c.id)} dragging={dragging} />}
                         {c.type === 'telesignal' && <TeleSignal c={c} send={send(c.id)} dragging={dragging} />}
                         {c.type === 'telemetry' && <Telemetry c={c} send={send(c.id)} dragging={dragging} />}
                         {c.type === 'protection' && <Protection c={c} trip={() => runScenario(name, 'trip', { prot: c.id })} dragging={dragging} />}
+                        </div>
                       </SortableItem>
                     ))}
                   </SortableContext>

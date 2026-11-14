@@ -2,6 +2,7 @@
 //! N IED contoh (IED_COUNT) di belakang proxy TCP, log kejadian, GET /ieds & /events, Socket.IO untuk UI.
 //! `iec61850-simulator ctl <host> <port> <reference> <nilai> [--interlock]`: kirim perintah kontrol (uji tanpa FEP).
 
+mod app;
 mod behavior;
 mod client;
 mod config;
@@ -29,6 +30,7 @@ use socketioxide::SocketIo;
 use tower_http::cors::CorsLayer;
 use tracing::{error, info};
 
+use app::{room, App};
 use behavior::{Gen, Mode};
 use model::{Cb, Component, CtlModel, IedConfig, Kind, Mx, ProtClass};
 
@@ -48,52 +50,6 @@ async fn main() {
     info!("simulator berhenti");
 }
 
-/// State bersama HTTP API & Socket.IO.
-struct App {
-    slots: Vec<manager::Slot>,
-    events: Arc<events::Events>,
-    io: SocketIo,
-}
-
-impl App {
-    fn ieds_json(&self) -> Value {
-        Value::Array(self.slots.iter().map(manager::Slot::info).collect())
-    }
-
-    fn slot(&self, name: &str) -> Result<&manager::Slot, String> {
-        self.slots.iter().find(|s| s.name == name).ok_or_else(|| format!("IED {name} tidak ada"))
-    }
-
-    /// IED yang sedang hidup
-    fn ied(&self, name: &Value) -> Result<Arc<server::Ied>, String> {
-        self.slot(name.as_str().unwrap_or_default())?.running()
-    }
-
-    /// Kirim `components` ke UI yang membuka IED ini (mis. setelah urutan berubah / IED hidup lagi)
-    fn push_components(&self, name: &str) {
-        if let Some(ied) = self.slot(name).ok().and_then(manager::Slot::ied) {
-            let _ = self.io.to(room(name)).emit("components", &ied.components_json());
-        }
-    }
-
-    async fn run_scenario(&self, name: &str, sc: &str, p: &Value) -> Result<String, String> {
-        self.slot(name)?.run_scenario(sc, p).await
-    }
-
-    async fn stop_scenario(&self, name: &str, sc: &str) -> Result<String, String> {
-        let r = self.slot(name)?.stop_scenario(sc).await;
-        if r.is_ok() && sc == "off" {
-            self.push_components(name); // IED baru: UI yang terbuka perlu konfigurasi + nilai awal
-        }
-        r
-    }
-}
-
-/// Room Socket.IO per IED
-fn room(ied: &str) -> String {
-    format!("ied:{ied}")
-}
-
 fn ack_json(r: Result<String, String>) -> Value {
     match r {
         Ok(m) => json!({ "ok": true, "message": m }),
@@ -101,39 +57,39 @@ fn ack_json(r: Result<String, String>) -> Value {
     }
 }
 
+/// Teks field `name` di payload Socket.IO
+fn s<'a>(d: &'a Value, k: &str) -> &'a str {
+    d[k].as_str().unwrap_or_default()
+}
+
 async fn run() -> Result<(), String> {
     let cfg = config::Config::from_env()?;
     info!("simulator mulai, libIEC61850 {}", lib_version());
 
-    let cfgs = (1..=cfg.ied_count).map(|n| demo_ied(&cfg, n)).collect::<Result<Vec<_>, _>>()?;
-    model::validate_all(&cfgs)?;
-    let events = Arc::new(events::Events::new());
-    let mut slots = Vec::new();
-    for c in cfgs {
-        let ld = c.ld.clone();
-        let slot = manager::Slot::start(c, Arc::clone(&events))?;
-        info!("IED {} jalan, MMS port {}, domain {}{ld}", slot.name, slot.port, slot.name);
-        slots.push(slot);
-    }
     let (sio_layer, io) = SocketIo::new_layer();
-    let app = Arc::new(App { slots, events, io: io.clone() });
+    let app = Arc::new(App::new(io.clone(), Arc::new(events::Events::new()), cfg.clone()));
+    let demo_cfg = cfg.clone();
+    app.load(move || (1..=demo_cfg.ied_count).map(|n| demo_ied(&demo_cfg, n)).collect()).await?;
+    for sl in app.slots() {
+        info!("IED {} port MMS {} ({})", sl.name(), sl.port(), sl.info()["status"]);
+    }
 
     let a = Arc::clone(&app);
-    io.ns("/", move |s: SocketRef| {
-        info!("UI tersambung: {}", s.id);
-        let _ = s.emit("ieds", &a.ieds_json());
+    io.ns("/", move |sock: SocketRef| {
+        info!("UI tersambung: {}", sock.id);
+        let _ = sock.emit("ieds", &a.ieds_json());
         let recent: Vec<Value> = a.events.query(None, None, 200).iter().map(events::Event::json).collect();
-        let _ = s.emit("event_log", &recent);
-        s.on_disconnect(|s: SocketRef| info!("UI terputus: {}", s.id));
+        let _ = sock.emit("event_log", &recent);
+        sock.on_disconnect(|s: SocketRef| info!("UI terputus: {}", s.id));
 
         let a2 = Arc::clone(&a);
-        s.on("get_initial_data", move |s: SocketRef| {
+        sock.on("get_initial_data", move |s: SocketRef| {
             let _ = s.emit("ieds", &a2.ieds_json());
         });
         // Buka halaman detail IED: masuk room IED itu (satu IED per tab), terima `components` lalu `value_changed`.
         // IED yang sedang mati: tetap masuk room, `components` dikirim saat hidup lagi.
         let a2 = Arc::clone(&a);
-        s.on("subscribe_ied", move |s: SocketRef, Data(d): Data<Value>| {
+        sock.on("subscribe_ied", move |s: SocketRef, Data(d): Data<Value>| {
             let name = d["ied"].as_str().unwrap_or_default();
             match a2.slot(name) {
                 Ok(slot) => {
@@ -148,56 +104,101 @@ async fn run() -> Result<(), String> {
                 }
             }
         });
-        s.on("unsubscribe_ied", |s: SocketRef| {
+        sock.on("unsubscribe_ied", |s: SocketRef| {
             s.leave_all();
         });
         // Ubah manual; hasil lewat ack {ok, message} supaya UI bisa menampilkan toast
         let a2 = Arc::clone(&a);
-        s.on("set_value", move |Data(d): Data<Value>, ack: AckSender| {
-            let res = a2.ied(&d["ied"]).and_then(|ied| ied.set(d["id"].as_str().unwrap_or_default(), &d));
+        sock.on("set_value", move |Data(d): Data<Value>, ack: AckSender| {
+            let res = a2.ied(s(&d, "ied")).and_then(|ied| ied.set(s(&d, "id"), &d));
             let _ = ack.send(&ack_json(res));
+        });
+        let a2 = Arc::clone(&a);
+        sock.on("update_order", move |Data(d): Data<Value>, ack: AckSender| {
+            let ids = d["order"].as_array().into_iter().flatten().filter_map(|v| v.as_str().map(String::from)).collect();
+            let _ = ack.send(&ack_json(a2.set_order(s(&d, "ied"), ids)));
         });
         // Skenario (PLAN bagian 6): {ied, scenario, params} / {ied, scenario}
         let a2 = Arc::clone(&a);
-        s.on("run_scenario", move |Data(d): Data<Value>, ack: AckSender| async move {
-            let res = a2.run_scenario(d["ied"].as_str().unwrap_or_default(), d["scenario"].as_str().unwrap_or_default(), &d["params"]).await;
+        sock.on("run_scenario", move |Data(d): Data<Value>, ack: AckSender| async move {
+            let res = match a2.slot(s(&d, "ied")) {
+                Ok(sl) => sl.run_scenario(s(&d, "scenario"), &d["params"]).await,
+                Err(e) => Err(e),
+            };
             let _ = ack.send(&ack_json(res));
         });
         let a2 = Arc::clone(&a);
-        s.on("stop_scenario", move |Data(d): Data<Value>, ack: AckSender| async move {
-            let res = a2.stop_scenario(d["ied"].as_str().unwrap_or_default(), d["scenario"].as_str().unwrap_or_default()).await;
-            let _ = ack.send(&ack_json(res));
-        });
-        let a2 = Arc::clone(&a);
-        s.on("update_order", move |Data(d): Data<Value>, ack: AckSender| {
-            let res = a2.ied(&d["ied"]).and_then(|ied| {
-                let ids = d["order"].as_array().into_iter().flatten().filter_map(|v| v.as_str().map(String::from)).collect();
-                ied.set_order(ids).map(|_| "urutan disimpan".to_string())
-            });
-            if res.is_ok() {
-                a2.push_components(d["ied"].as_str().unwrap_or_default());
+        sock.on("stop_scenario", move |Data(d): Data<Value>, ack: AckSender| async move {
+            let res = match a2.slot(s(&d, "ied")) {
+                Ok(sl) => sl.stop_scenario(s(&d, "scenario")).await,
+                Err(e) => Err(e),
+            };
+            if res.is_ok() && s(&d, "scenario") == "off" {
+                a2.push_components(s(&d, "ied")); // IED dibuat ulang: UI perlu konfigurasi + nilai awal
             }
             let _ = ack.send(&ack_json(res));
+        });
+        // Konfigurasi (fase 8): IED & komponen; IED yang modelnya berubah restart otomatis
+        let a2 = Arc::clone(&a);
+        sock.on("add_ied", move |Data(d): Data<Value>, ack: AckSender| async move {
+            let _ = ack.send(&ack_json(a2.add_ied(&d).await));
+        });
+        let a2 = Arc::clone(&a);
+        sock.on("update_ied", move |Data(d): Data<Value>, ack: AckSender| async move {
+            let _ = ack.send(&ack_json(a2.update_ied(s(&d, "ied"), &d).await));
+        });
+        let a2 = Arc::clone(&a);
+        sock.on("remove_ied", move |Data(d): Data<Value>, ack: AckSender| async move {
+            let _ = ack.send(&ack_json(a2.remove_ied(s(&d, "ied")).await));
+        });
+        let a2 = Arc::clone(&a);
+        sock.on("add_component", move |Data(d): Data<Value>, ack: AckSender| async move {
+            let _ = ack.send(&ack_json(a2.add_component(s(&d, "ied"), &d["component"]).await));
+        });
+        let a2 = Arc::clone(&a);
+        sock.on("update_component", move |Data(d): Data<Value>, ack: AckSender| async move {
+            let _ = ack.send(&ack_json(a2.update_component(s(&d, "ied"), s(&d, "id"), &d["component"]).await));
+        });
+        let a2 = Arc::clone(&a);
+        sock.on("remove_component", move |Data(d): Data<Value>, ack: AckSender| async move {
+            let _ = ack.send(&ack_json(a2.remove_component(s(&d, "ied"), s(&d, "id")).await));
+        });
+        // export: ack {ok, message, data}; import: {data, ied?}
+        let a2 = Arc::clone(&a);
+        sock.on("export_data", move |Data(d): Data<Value>, ack: AckSender| {
+            let r = match a2.export(d["ied"].as_str()) {
+                Ok(data) => json!({ "ok": true, "message": "export", "data": data }),
+                Err(e) => json!({ "ok": false, "message": e }),
+            };
+            let _ = ack.send(&r);
+        });
+        let a2 = Arc::clone(&a);
+        sock.on("import_data", move |Data(d): Data<Value>, ack: AckSender| async move {
+            let _ = ack.send(&ack_json(a2.import(&d["data"], d["ied"].as_str()).await));
         });
     });
     // Nilai live: per IED tiap 300 ms, hanya yang berubah, hanya ke room IED itu (PLAN 7.1)
     let a = Arc::clone(&app);
     tokio::spawn(async move {
-        let mut last: Vec<Vec<Value>> = vec![Vec::new(); a.slots.len()];
+        let mut last: HashMap<String, Vec<Value>> = HashMap::new();
         let mut tick = tokio::time::interval(Duration::from_millis(300));
         loop {
             tick.tick().await;
-            for (slot, last) in a.slots.iter().zip(&mut last) {
-                let Some(ied) = slot.ied() else {
-                    last.clear();
+            let slots = a.slots();
+            last.retain(|n, _| slots.iter().any(|sl| sl.name() == *n));
+            for sl in slots {
+                let name = sl.name();
+                let Some(ied) = sl.ied() else {
+                    last.remove(&name);
                     continue;
                 };
                 let now = ied.live_values();
-                let changed: Vec<&Value> = now.iter().filter(|v| !last.contains(v)).collect();
+                let prev = last.entry(name.clone()).or_default();
+                let changed: Vec<&Value> = now.iter().filter(|v| !prev.contains(v)).collect();
                 if !changed.is_empty() {
-                    let _ = a.io.to(room(&slot.name)).emit("value_changed", &json!({ "ied": slot.name, "values": changed }));
+                    let _ = a.io.to(room(&name)).emit("value_changed", &json!({ "ied": name, "values": changed }));
                 }
-                *last = now;
+                *prev = now;
             }
         }
     });
@@ -238,6 +239,8 @@ async fn run() -> Result<(), String> {
         .route("/health", get(health))
         .route("/ieds", get(get_ieds))
         .route("/events", get(get_events))
+        .route("/export", get(get_export))
+        .route("/import", post(post_import))
         .route("/ieds/{name}/scenarios/{scenario}", post(post_scenario))
         .route("/ieds/{name}/scenarios/{scenario}/stop", post(post_scenario_stop))
         .route("/ieds/{name}/points/{reference}", put(put_point))
@@ -274,13 +277,22 @@ fn body_json(b: &Bytes) -> Result<Value, (StatusCode, Json<Value>)> {
 /// `POST /ieds/{name}/scenarios/{scenario}` (body: parameter, mis. `{"ms": 500}`)
 async fn post_scenario(State(app): State<Arc<App>>, Path((name, sc)): Path<(String, String)>, body: Bytes) -> ApiResult {
     let p = body_json(&body)?;
-    let r = app.run_scenario(&name, &sc, &p).await;
+    let r = match app.slot(&name) {
+        Ok(sl) => sl.run_scenario(&sc, &p).await,
+        Err(e) => Err(e),
+    };
     api_result(&app, &name, r)
 }
 
 /// `POST /ieds/{name}/scenarios/{scenario}/stop`
 async fn post_scenario_stop(State(app): State<Arc<App>>, Path((name, sc)): Path<(String, String)>) -> ApiResult {
-    let r = app.stop_scenario(&name, &sc).await;
+    let r = match app.slot(&name) {
+        Ok(sl) => sl.stop_scenario(&sc).await,
+        Err(e) => Err(e),
+    };
+    if r.is_ok() && sc == "off" {
+        app.push_components(&name);
+    }
     api_result(&app, &name, r)
 }
 
@@ -288,11 +300,23 @@ async fn post_scenario_stop(State(app): State<Arc<App>>, Path((name, sc)): Path<
 /// body sama dengan `set_value` UI, plus `{"quality": {"validity": "invalid", "flags": ["oldData"]}}`
 async fn put_point(State(app): State<Arc<App>>, Path((name, r)): Path<(String, String)>, body: Bytes) -> ApiResult {
     let cmd = body_json(&body)?;
-    let res = app.ied(&json!(name)).and_then(|ied| {
+    let res = app.ied(&name).and_then(|ied| {
         let id = ied.resolve(&r).ok_or_else(|| format!("titik {r} tidak ada di {name}"))?;
         ied.set(&id, &cmd)
     });
     api_result(&app, &name, res)
+}
+
+/// `GET /export[?ied=SIMIED1]`: konfigurasi semua IED / satu IED (format sama dengan autosave)
+async fn get_export(State(app): State<Arc<App>>, Query(q): Query<HashMap<String, String>>) -> ApiResult {
+    app.export(q.get("ied").map(String::as_str)).map(Json).map_err(|e| (StatusCode::NOT_FOUND, Json(ack_json(Err(e)))))
+}
+
+/// `POST /import[?ied=SIMIED1]`: tanpa `ied` semua IED diganti; dengan `ied` komponen IED itu diganti
+async fn post_import(State(app): State<Arc<App>>, Query(q): Query<HashMap<String, String>>, body: Bytes) -> ApiResult {
+    let data = body_json(&body)?;
+    let r = app.import(&data, q.get("ied").map(String::as_str)).await;
+    r.map(|m| Json(ack_json(Ok(m)))).map_err(|m| (StatusCode::BAD_REQUEST, Json(ack_json(Err(m)))))
 }
 
 /// `GET /ieds`: status semua IED
@@ -304,7 +328,7 @@ async fn get_ieds(State(app): State<Arc<App>>) -> Json<Value> {
 async fn get_events(State(app): State<Arc<App>>, Query(q): Query<HashMap<String, String>>) -> Result<Json<Value>, (StatusCode, String)> {
     let bad = |m: String| (StatusCode::BAD_REQUEST, m);
     let kind = match q.get("type") {
-        Some(t) => Some(events::Kind::parse(t).ok_or_else(|| bad(format!("type tidak dikenal: {t} (connection/rcb/control/report/manual/scenario)")))?),
+        Some(t) => Some(events::Kind::parse(t).ok_or_else(|| bad(format!("type tidak dikenal: {t} (connection/rcb/control/report/manual/scenario/config)")))?),
         None => None,
     };
     let limit = match q.get("limit") {
@@ -368,6 +392,7 @@ fn demo_ied(cfg: &config::Config, n: u16) -> Result<IedConfig, String> {
             tm("an1", Mx::preset("generic", 1, "1")?, 123.4, Gen::manual(), None),
             Component { id: "prot1".into(), kind: Kind::Protection { class: ProtClass::Ptoc, inst: 1, cb: "cb1".into() } },
         ],
+        ..Default::default()
     })
 }
 

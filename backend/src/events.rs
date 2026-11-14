@@ -24,6 +24,8 @@ pub enum Kind {
     Manual,
     /// skenario mulai / selesai
     Scenario,
+    /// perubahan konfigurasi (IED / komponen / import)
+    Config,
 }
 
 impl Kind {
@@ -35,11 +37,12 @@ impl Kind {
             Self::Report => "report",
             Self::Manual => "manual",
             Self::Scenario => "scenario",
+            Self::Config => "config",
         }
     }
 
     pub fn parse(s: &str) -> Option<Self> {
-        [Self::Connection, Self::Rcb, Self::Control, Self::Report, Self::Manual, Self::Scenario].into_iter().find(|k| k.as_str() == s)
+        [Self::Connection, Self::Rcb, Self::Control, Self::Report, Self::Manual, Self::Scenario, Self::Config].into_iter().find(|k| k.as_str() == s)
     }
 }
 

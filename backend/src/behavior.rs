@@ -1,6 +1,7 @@
 //! Generator nilai auto mode (PLAN bagian 5). Parameter mengikuti acuan: interval, min..max, scale factor.
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Mode {
     /// Nilai hanya berubah dari UI / API / perintah FEP
     Manual,
@@ -14,7 +15,9 @@ pub enum Mode {
     Sine,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+/// Field yang tidak ada di JSON memakai nilai [`Gen::manual`].
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct Gen {
     pub mode: Mode,
     pub interval_ms: u64,
@@ -26,6 +29,12 @@ pub struct Gen {
     pub step: f64,
     /// sine: periode gelombang (detik)
     pub period_s: f64,
+}
+
+impl Default for Gen {
+    fn default() -> Self {
+        Self::manual()
+    }
 }
 
 impl Gen {
