@@ -60,6 +60,10 @@ impl CtlModel {
     fn is_sbo(self) -> bool {
         matches!(self, Self::SboNormal | Self::SboEnhanced)
     }
+
+    fn is_enhanced(self) -> bool {
+        matches!(self, Self::DirectEnhanced | Self::SboEnhanced)
+    }
 }
 
 /// Circuit Breaker: `XCBR<inst>` + `CSWI<inst>`.
@@ -220,7 +224,22 @@ fn valid_ident(s: &str) -> bool {
     s.chars().next().is_some_and(|c| c.is_ascii_alphabetic()) && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
-/// Validasi satu IED. ponytail: keunikan nama antar IED dicek di manager (fase 5)
+/// Validasi semua IED: masing-masing valid, nama IED & port MMS unik.
+pub fn validate_all(cfgs: &[IedConfig]) -> Result<(), String> {
+    let (mut names, mut ports) = (HashSet::new(), HashSet::new());
+    for c in cfgs {
+        validate(c)?;
+        if !names.insert(c.name.as_str()) {
+            return Err(format!("nama IED {} dipakai lebih dari sekali", c.name));
+        }
+        if !ports.insert(c.port) {
+            return Err(format!("port MMS {} dipakai lebih dari satu IED ({})", c.port, c.name));
+        }
+    }
+    Ok(())
+}
+
+/// Validasi satu IED (keunikan antar IED: [`validate_all`]).
 pub fn validate(cfg: &IedConfig) -> Result<(), String> {
     for (what, s) in [("nama IED", &cfg.name), ("nama LD", &cfg.ld)] {
         if !valid_ident(s) {
@@ -329,6 +348,8 @@ pub struct CtlSpec {
     pub interlock: bool,
     /// false = status-only: tidak ada handler kontrol (spec tetap dipakai generator auto tap)
     pub controllable: bool,
+    /// security enhanced (ada CommandTermination)
+    pub enhanced: bool,
     pub act: CtlAct,
 }
 
@@ -451,6 +472,7 @@ pub fn build(cfg: &IedConfig) -> Built {
                             loc_ref: format!("CSWI{n}.Loc"),
                             interlock: cb.interlock,
                             controllable: true,
+                            enhanced: cb.ctl.is_enhanced(),
                             act: CtlAct::Cb { mirror: format!("XCBR{n}.Pos"), travel_ms: cb.travel_ms, accept_same: cb.accept_same },
                         });
                     }
@@ -490,6 +512,7 @@ pub fn build(cfg: &IedConfig) -> Built {
                         loc_ref: loc_ref.clone(),
                         interlock: false,
                         controllable,
+                        enhanced: ctl.is_enhanced(),
                         act: CtlAct::Tap {
                             mirror: format!("{yltc}.TapPos"),
                             auto: format!("{atcc}.Auto"),
@@ -504,6 +527,7 @@ pub fn build(cfg: &IedConfig) -> Built {
                             loc_ref,
                             interlock: false,
                             controllable,
+                            enhanced: false,
                             act: CtlAct::Auto,
                         });
                     }
@@ -588,6 +612,94 @@ pub fn build(cfg: &IedConfig) -> Built {
     b
 }
 
+/// Reference titik-titik satu komponen (relatif ke LD), untuk tampilan & ubah manual dari UI.
+pub enum Refs {
+    Cb { xcbr: String, cswi: String },
+    Tap { yltc: String, atcc: String },
+    /// telesignal / telemetry: DO + atribut nilai (`stVal` / `mag.f` / `cVal.mag.f`)
+    Point { do_ref: String, value_ref: String },
+}
+
+impl CtlModel {
+    fn name(self) -> &'static str {
+        match self {
+            Self::StatusOnly => "status-only",
+            Self::DirectNormal => "direct-normal",
+            Self::SboNormal => "sbo-normal",
+            Self::DirectEnhanced => "direct-enhanced",
+            Self::SboEnhanced => "sbo-enhanced",
+        }
+    }
+}
+
+fn mode_name(m: Mode) -> &'static str {
+    match m {
+        Mode::Manual => "manual",
+        Mode::Toggle => "toggle",
+        Mode::Random => "random",
+        Mode::RandomWalk => "random_walk",
+        Mode::Sine => "sine",
+    }
+}
+
+impl Mx {
+    /// Satuan tampilan di UI (nilai di model tetap apa adanya)
+    fn unit(&self) -> &'static str {
+        match self.do_name.as_str() {
+            "TotW" | "W" => "MW",
+            "TotVAr" | "VAr" => "MVAr",
+            "TotVA" | "VA" => "MVA",
+            "Hz" => "Hz",
+            "PhV" | "PPV" => "kV",
+            "A" => "A",
+            "Z" => "Ω",
+            _ => "",
+        }
+    }
+}
+
+impl Component {
+    pub fn refs(&self) -> Refs {
+        match &self.kind {
+            Kind::CircuitBreaker(cb) => Refs::Cb { xcbr: format!("XCBR{}", cb.inst), cswi: format!("CSWI{}", cb.inst) },
+            Kind::TapChanger { inst, .. } => Refs::Tap { yltc: format!("YLTC{inst}"), atcc: format!("ATCC{inst}") },
+            Kind::Telesignal { ggio, ind, .. } => {
+                let do_ref = format!("GGIO{ggio}.Ind{ind}");
+                Refs::Point { value_ref: format!("{do_ref}.stVal"), do_ref }
+            }
+            Kind::Telemetry { mx, .. } => {
+                let do_ref = format!("{}.{}", mx.ln(), mx.path());
+                let mag = if mx.phase.is_some() { "cVal.mag.f" } else { "mag.f" };
+                Refs::Point { value_ref: format!("{do_ref}.{mag}"), do_ref }
+            }
+        }
+    }
+
+    /// Konfigurasi komponen untuk UI (bagian statis event `components`)
+    pub fn describe(&self) -> serde_json::Value {
+        use serde_json::json;
+        let gen = |g: &Gen| json!({ "mode": mode_name(g.mode), "interval_ms": g.interval_ms, "min": g.min, "max": g.max, "scale": g.scale });
+        match (&self.kind, self.refs()) {
+            (Kind::CircuitBreaker(cb), Refs::Cb { xcbr, cswi }) => json!({
+                "id": self.id, "type": "cb", "ln": format!("{xcbr} / {cswi}"), "ctl_model": cb.ctl.name(),
+                "travel_ms": cb.travel_ms, "interlock": cb.interlock, "accept_same": cb.accept_same,
+                "sbo_timeout_ms": if cb.ctl.is_sbo() { Some(cb.sbo_timeout_ms) } else { None },
+            }),
+            (Kind::TapChanger { min, max, ctl, interval_ms, .. }, Refs::Tap { yltc, atcc }) => json!({
+                "id": self.id, "type": "tap", "ln": format!("{yltc} / {atcc}"), "ctl_model": ctl.name(),
+                "min": min, "max": max, "interval_ms": interval_ms,
+            }),
+            (Kind::Telesignal { gen: g, .. }, Refs::Point { do_ref, .. }) => json!({
+                "id": self.id, "type": "telesignal", "ref": do_ref, "gen": gen(g),
+            }),
+            (Kind::Telemetry { mx, gen: g, follow_cb, .. }, Refs::Point { do_ref, .. }) => json!({
+                "id": self.id, "type": "telemetry", "ref": do_ref, "unit": mx.unit(), "gen": gen(g), "follow_cb": follow_cb,
+            }),
+            _ => unreachable!("refs() sesuai kind"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -653,6 +765,14 @@ mod tests {
             kind: Kind::Telemetry { mx: Mx::preset("MW", 1, "").unwrap(), value: 0.0, gen: Gen::manual(), follow_cb: Some("x".into()) },
         }]);
         assert!(validate(&follow_salah).is_err());
+    }
+
+    #[test]
+    fn nama_dan_port_unik_antar_ied() {
+        let ied = |name: &str, port| IedConfig { name: name.into(), ld: "LD0".into(), port, components: vec![] };
+        assert!(validate_all(&[ied("SIMIED1", 102), ied("SIMIED2", 10102)]).is_ok());
+        assert!(validate_all(&[ied("SIMIED1", 102), ied("SIMIED1", 10102)]).unwrap_err().contains("nama IED"));
+        assert!(validate_all(&[ied("SIMIED1", 102), ied("SIMIED2", 102)]).unwrap_err().contains("port MMS"));
     }
 
     #[test]

@@ -9,6 +9,9 @@ use crate::ffi;
 
 pub struct Conn(pub(crate) ffi::IedConnection);
 
+// SAFETY: IedConnection libIEC61850 boleh dipindah antar thread (dipakai satu thread pada satu waktu)
+unsafe impl Send for Conn {}
+
 impl Conn {
     pub fn connect(host: &str, port: u16) -> Result<Self, String> {
         let h = CString::new(host).map_err(|e| e.to_string())?;

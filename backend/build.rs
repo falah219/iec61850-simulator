@@ -19,14 +19,16 @@ fn main() {
         .clang_arg(format!("-I{INCLUDE_DIR}"))
         .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
         .prepend_enum_name(false)
-        // Server + model dinamis + CDC + handler kontrol; API client kontrol untuk test & perintah `ctl`
+        // Server + model dinamis + CDC + handler kontrol & RCB; API client (kontrol, RCB) untuk test & perintah `ctl`
         .allowlist_function(
             "LibIEC61850_getVersionString|IedServer_.*|IedModel_.*|LogicalDevice_create|LogicalNode_create|CDC_.*_create|Dbpos_.*\
-             |DataSet_create|DataSetEntry_create|DataAttribute_create|ReportControlBlock_create|ControlAction_.*\
-             |MmsValue_getBoolean|MmsValue_newBoolean|MmsValue_delete\
-             |IedConnection_create|IedConnection_connect|IedConnection_close|IedConnection_destroy|ControlObjectClient_.*",
+             |DataSet_create|DataSetEntry_create|DataAttribute_create|ReportControlBlock_create\
+             |ReportControlBlock_getName|ReportControlBlock_isBuffered|ReportControlBlock_getRptEna|ControlAction_.*|ClientConnection_getPeerAddress\
+             |MmsValue_getBoolean|MmsValue_newBoolean|MmsValue_delete|Quality_fromMmsValue\
+             |IedConnection_create|IedConnection_connect|IedConnection_close|IedConnection_destroy|ControlObjectClient_.*\
+             |IedConnection_getRCBValues|IedConnection_setRCBValues|ClientReportControlBlock_.*",
         )
-        .allowlist_var("CDC_.*|TRG_OPT_.*|RPT_OPT_.*|CONTROL_ORCAT_.*")
+        .allowlist_var("CDC_.*|TRG_OPT_.*|RPT_OPT_.*|CONTROL_ORCAT_.*|RCB_ELEMENT_.*|QUALITY_.*")
         .wrap_unsafe_ops(true)
         .generate()
         .expect("gagal generate binding libIEC61850");

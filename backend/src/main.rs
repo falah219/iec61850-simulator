@@ -1,20 +1,28 @@
 //! Simulator IED IEC 61850: HTTP API + Socket.IO untuk UI tester.
-//! Fase 4: satu IED contoh (generator, dataset & RCB, kontrol CB + tap changer).
+//! N IED contoh (IED_COUNT) di belakang proxy TCP, log kejadian, GET /ieds & /events, Socket.IO untuk UI.
 //! `iec61850-simulator ctl <host> <port> <reference> <nilai> [--interlock]`: kirim perintah kontrol (uji tanpa FEP).
 
 mod behavior;
 mod client;
 mod config;
+mod events;
 mod ffi;
 mod logger;
 mod model;
+mod proxy;
 mod server;
 
+use std::collections::HashMap;
 use std::ffi::CStr;
+use std::sync::Arc;
+use std::time::Duration;
 
+use axum::extract::{Query, State};
+use axum::http::StatusCode;
 use axum::{routing::get, Json, Router};
 use serde_json::{json, Value};
-use socketioxide::{extract::SocketRef, SocketIo};
+use socketioxide::extract::{AckSender, Data, SocketRef};
+use socketioxide::SocketIo;
 use tower_http::cors::CorsLayer;
 use tracing::{error, info};
 
@@ -37,34 +45,188 @@ async fn main() {
     info!("simulator berhenti");
 }
 
+/// State bersama HTTP API & Socket.IO.
+struct App {
+    ieds: Vec<server::Ied>,
+    events: Arc<events::Events>,
+}
+
+impl App {
+    fn ieds_json(&self) -> Value {
+        Value::Array(self.ieds.iter().map(server::Ied::info).collect())
+    }
+
+    fn ied(&self, name: &Value) -> Option<&server::Ied> {
+        self.ieds.iter().find(|i| Some(i.name.as_str()) == name.as_str())
+    }
+}
+
+/// Room Socket.IO per IED
+fn room(ied: &str) -> String {
+    format!("ied:{ied}")
+}
+
+fn ack_json(r: Result<String, String>) -> Value {
+    match r {
+        Ok(m) => json!({ "ok": true, "message": m }),
+        Err(m) => json!({ "ok": false, "message": m }),
+    }
+}
+
 async fn run() -> Result<(), String> {
     let cfg = config::Config::from_env()?;
     info!("simulator mulai, libIEC61850 {}", lib_version());
 
-    let ied = server::Ied::start(&demo_ied(&cfg)?)?;
-    info!("IED {} jalan, MMS port {}, domain {}{}", ied.name, ied.port, ied.name, cfg.ld_name);
+    let cfgs = (1..=cfg.ied_count).map(|n| demo_ied(&cfg, n)).collect::<Result<Vec<_>, _>>()?;
+    model::validate_all(&cfgs)?;
+    let events = Arc::new(events::Events::new());
+    let mut ieds = Vec::new();
+    for c in &cfgs {
+        let ied = server::Ied::start(c, Arc::clone(&events))?;
+        info!("IED {} jalan, MMS port {}, domain {}{}", ied.name, ied.port, ied.name, c.ld);
+        ieds.push(ied);
+    }
+    let app = Arc::new(App { ieds, events });
 
-    let ieds = json!([{ "name": ied.name, "port": ied.port, "status": "running" }]);
     let (sio_layer, io) = SocketIo::new_layer();
+    let a = Arc::clone(&app);
     io.ns("/", move |s: SocketRef| {
         info!("UI tersambung: {}", s.id);
-        let _ = s.emit("ieds", &ieds);
+        let _ = s.emit("ieds", &a.ieds_json());
+        let recent: Vec<Value> = a.events.query(None, None, 200).iter().map(events::Event::json).collect();
+        let _ = s.emit("event_log", &recent);
         s.on_disconnect(|s: SocketRef| info!("UI terputus: {}", s.id));
+
+        let a2 = Arc::clone(&a);
+        s.on("get_initial_data", move |s: SocketRef| {
+            let _ = s.emit("ieds", &a2.ieds_json());
+        });
+        // Buka halaman detail IED: masuk room IED itu (satu IED per tab), terima `components` lalu `value_changed`
+        let a2 = Arc::clone(&a);
+        s.on("subscribe_ied", move |s: SocketRef, Data(d): Data<Value>| {
+            let Some(ied) = a2.ied(&d["ied"]) else {
+                let _ = s.emit("error", &json!({ "message": format!("IED {} tidak ada", d["ied"]) }));
+                return;
+            };
+            s.leave_all();
+            s.join(room(&ied.name));
+            let _ = s.emit("components", &ied.components_json());
+        });
+        s.on("unsubscribe_ied", |s: SocketRef| {
+            s.leave_all();
+        });
+        // Ubah manual; hasil lewat ack {ok, message} supaya UI bisa menampilkan toast
+        let a2 = Arc::clone(&a);
+        s.on("set_value", move |Data(d): Data<Value>, ack: AckSender| {
+            let res = match a2.ied(&d["ied"]) {
+                Some(ied) => ied.set(d["id"].as_str().unwrap_or_default(), &d),
+                None => Err(format!("IED {} tidak ada", d["ied"])),
+            };
+            let _ = ack.send(&ack_json(res));
+        });
+        let a2 = Arc::clone(&a);
+        s.on("update_order", move |s: SocketRef, Data(d): Data<Value>, ack: AckSender| {
+            let res = match a2.ied(&d["ied"]) {
+                Some(ied) => {
+                    let ids = d["order"].as_array().into_iter().flatten().filter_map(|v| v.as_str().map(String::from)).collect();
+                    let r = ied.set_order(ids).map(|_| "urutan disimpan".to_string());
+                    if r.is_ok() {
+                        let _ = s.within(room(&ied.name)).emit("components", &ied.components_json());
+                    }
+                    r
+                }
+                None => Err(format!("IED {} tidak ada", d["ied"])),
+            };
+            let _ = ack.send(&ack_json(res));
+        });
+    });
+    // Nilai live: per IED tiap 300 ms, hanya yang berubah, hanya ke room IED itu (PLAN 7.1)
+    let a = Arc::clone(&app);
+    let io3 = io.clone();
+    tokio::spawn(async move {
+        let mut last: Vec<Vec<Value>> = vec![Vec::new(); a.ieds.len()];
+        let mut tick = tokio::time::interval(Duration::from_millis(300));
+        loop {
+            tick.tick().await;
+            for (ied, last) in a.ieds.iter().zip(&mut last) {
+                let now = ied.live_values();
+                let changed: Vec<&Value> = now.iter().filter(|v| !last.contains(v)).collect();
+                if !changed.is_empty() {
+                    let _ = io3.to(room(&ied.name)).emit("value_changed", &json!({ "ied": ied.name, "values": changed }));
+                }
+                *last = now;
+            }
+        }
+    });
+    // Log kejadian real-time ke semua UI (volume kecil: report sudah dikelompokkan per detik)
+    let mut rx = app.events.subscribe();
+    let io2 = io.clone();
+    tokio::spawn(async move {
+        loop {
+            match rx.recv().await {
+                Ok(e) => {
+                    let _ = io2.emit("event_log", &[e.json()]);
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                Err(_) => break,
+            }
+        }
+    });
+    // Daftar IED (status, jumlah client, RCB aktif) dikirim ulang hanya kalau berubah, maks 1x per detik
+    let a = Arc::clone(&app);
+    tokio::spawn(async move {
+        let mut last = Value::Null;
+        let mut tick = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            tick.tick().await;
+            let now = a.ieds_json();
+            // last_event berubah terus selama ada report; tidak memicu kirim ulang sendiri
+            let mut cmp = now.clone();
+            cmp.as_array_mut().into_iter().flatten().for_each(|i| i["last_event"] = Value::Null);
+            if cmp != last {
+                let _ = io.emit("ieds", &now);
+                last = cmp;
+            }
+        }
     });
 
     // CORS paling luar: UI jalan di port lain (Socket.IO polling butuh CORS)
-    let app = Router::new().route("/health", get(health)).layer(sio_layer).layer(CorsLayer::permissive());
+    let http = Router::new()
+        .route("/health", get(health))
+        .route("/ieds", get(get_ieds))
+        .route("/events", get(get_events))
+        .with_state(Arc::clone(&app))
+        .layer(sio_layer)
+        .layer(CorsLayer::permissive());
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", cfg.http_port))
         .await
         .map_err(|e| format!("gagal listen HTTP di port {}: {e}", cfg.http_port))?;
     info!("HTTP + Socket.IO di port {}", cfg.http_port);
-    axum::serve(listener, app)
+    axum::serve(listener, http)
         .with_graceful_shutdown(shutdown_signal())
         .await
         .map_err(|e| format!("server HTTP berhenti karena error: {e}"))?;
+    Ok(()) // IED (server MMS + proxy) berhenti saat App di-drop
+}
 
-    drop(ied); // stop MMS server sebelum keluar
-    Ok(())
+/// `GET /ieds`: status semua IED
+async fn get_ieds(State(app): State<Arc<App>>) -> Json<Value> {
+    Json(app.ieds_json())
+}
+
+/// `GET /events?ied=&type=&limit=`: log kejadian terbaru (urut lama -> baru, default 100)
+async fn get_events(State(app): State<Arc<App>>, Query(q): Query<HashMap<String, String>>) -> Result<Json<Value>, (StatusCode, String)> {
+    let bad = |m: String| (StatusCode::BAD_REQUEST, m);
+    let kind = match q.get("type") {
+        Some(t) => Some(events::Kind::parse(t).ok_or_else(|| bad(format!("type tidak dikenal: {t} (connection/rcb/control/report)")))?),
+        None => None,
+    };
+    let limit = match q.get("limit") {
+        Some(l) => l.parse().map_err(|_| bad(format!("limit tidak valid: {l}")))?,
+        None => 100,
+    };
+    let list = app.events.query(q.get("ied").map(String::as_str), kind, limit);
+    Ok(Json(Value::Array(list.iter().map(events::Event::json).collect())))
 }
 
 /// `ctl <host> <port> <reference> <nilai> [--interlock]`, mis. `ctl 127.0.0.1 102 SIMIED1LD0/CSWI1.Pos open`
@@ -90,8 +252,8 @@ fn ctl_cmd(a: &[String]) -> i32 {
     }
 }
 
-/// IED contoh. ponytail: komponen tetap di kode; tambah/ubah dari UI di fase 8
-fn demo_ied(cfg: &config::Config) -> Result<IedConfig, String> {
+/// IED contoh ke-n (semua IED memakai template yang sama). ponytail: komponen tetap di kode; tambah/ubah dari UI di fase 8
+fn demo_ied(cfg: &config::Config, n: u16) -> Result<IedConfig, String> {
     let g = |mode, interval_ms, min, max, scale| Gen { mode, interval_ms, min, max, scale, step: (max - min) * 0.05, period_s: 60.0 };
     let tm = |id: &str, mx: Mx, value, gen, follow: Option<&str>| Component {
         id: id.into(),
@@ -100,9 +262,9 @@ fn demo_ied(cfg: &config::Config) -> Result<IedConfig, String> {
     let ts = |id: &str, ind, value, gen| Component { id: id.into(), kind: Kind::Telesignal { ggio: 1, ind, value, gen } };
     let cb = |id: &str, c: Cb| Component { id: id.into(), kind: Kind::CircuitBreaker(c) };
     Ok(IedConfig {
-        name: cfg.ied_name.clone(),
+        name: format!("{}{n}", cfg.ied_prefix),
         ld: cfg.ld_name.clone(),
-        port: cfg.mms_port,
+        port: cfg.port_of(n)?,
         components: vec![
             cb("cb1", Cb { inst: 1, closed: true, ctl: CtlModel::SboEnhanced, ..Cb::default() }),
             cb("cb2", Cb { inst: 2, closed: false, ctl: CtlModel::SboNormal, ..Cb::default() }),

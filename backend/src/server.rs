@@ -1,21 +1,81 @@
-//! Satu IED = satu IedServer libIEC61850 dengan model dinamis + handler kontrol + task generator nilai.
+//! Satu IED = satu IedServer libIEC61850 (listen di 127.0.0.1) dengan model dinamis + handler kontrol
+//! & RCB + task generator nilai, di belakang proxy TCP yang memegang port publik.
 
-use std::ffi::{c_void, CString};
+use std::ffi::{c_char, c_void, CStr, CString};
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use serde_json::{json, Value};
 use tokio::task::JoinHandle;
-use tracing::{info, warn};
 
 use crate::behavior::{Mode, Rng};
 use crate::client::add_cause_name;
+use crate::events::{Events, Kind as Ev};
 use crate::ffi;
-use crate::model::{self, CtlAct, CtlSpec, IedConfig, Point, Val};
+use crate::model::{self, CtlAct, CtlSpec, IedConfig, Point, Refs, Val};
+use crate::proxy::{self, Client};
 
 const VENDOR: &str = "iec61850-simulator";
 /// Resolusi generator. ponytail: interval titik dibulatkan ke 100 ms; kecilkan kalau butuh lebih halus
 const TICK: Duration = Duration::from_millis(100);
+/// Report dikelompokkan per periode ini di log kejadian (PLAN 7.3)
+const REPORT_FLUSH: Duration = Duration::from_secs(1);
+
+/// Mutex yang tetap bisa dipakai walau thread lain panic saat memegangnya (data di sini hanya daftar/hitungan).
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// State bersama satu IED: dipakai proxy, handler kontrol & RCB (thread libIEC61850), generator, dan API.
+pub struct IedCtx {
+    pub name: String,
+    events: Arc<Events>,
+    clients: Mutex<Vec<Client>>,
+    /// RCB aktif: (nama RCB, client yang meng-enable)
+    rcbs: Mutex<Vec<(String, String)>>,
+    /// jumlah report yang dibuat per RCB sejak flush terakhir
+    reports: Mutex<Vec<(String, u32)>>,
+}
+
+impl IedCtx {
+    pub fn event(&self, kind: Ev, msg: String) {
+        self.events.push(&self.name, kind, msg);
+    }
+
+    pub fn add_client(&self, c: Client) {
+        lock(&self.clients).push(c);
+    }
+
+    pub fn remove_client(&self, internal_port: u16) {
+        lock(&self.clients).retain(|c| c.internal_port != internal_port);
+    }
+
+    pub fn client_count(&self) -> usize {
+        lock(&self.clients).len()
+    }
+
+    /// Alamat client asli dari ClientConnection libIEC61850. IedServer hanya melihat 127.0.0.1:<port proxy>,
+    /// jadi dipetakan lewat port internal yang dicatat proxy.
+    fn peer(&self, conn: ffi::ClientConnection) -> String {
+        if conn.is_null() {
+            return "-".into();
+        }
+        // SAFETY: conn valid selama handler; string milik library, di-copy sebelum return
+        let raw = unsafe { CStr::from_ptr(ffi::ClientConnection_getPeerAddress(conn)) }.to_string_lossy().into_owned();
+        let port = raw.rsplit(':').next().and_then(|p| p.parse::<u16>().ok());
+        lock(&self.clients).iter().find(|c| Some(c.internal_port) == port).map_or(raw, |c| c.peer.to_string())
+    }
+
+    /// Satu kejadian "report terkirim" per periode, berisi jumlah report per RCB.
+    fn flush_reports(&self) {
+        let counts = std::mem::take(&mut *lock(&self.reports));
+        if !counts.is_empty() {
+            let list: Vec<String> = counts.iter().map(|(r, n)| format!("{r}×{n}")).collect();
+            self.event(Ev::Report, format!("report terkirim ({}s): {}", REPORT_FLUSH.as_secs(), list.join(", ")));
+        }
+    }
+}
 
 struct Inner {
     name: String,
@@ -24,6 +84,8 @@ struct Inner {
     server: ffi::IedServer,
     /// Parameter handler kontrol (alamat Box tetap). Di-drop SETELAH server dihancurkan (lihat Drop).
     ctls: Vec<Box<Ctl>>,
+    /// Parameter handler RCB (Arc::as_ptr); ikut di-drop setelah server dihancurkan.
+    ctx: Arc<IedCtx>,
 }
 
 // SAFETY: IedServer/IedModel hanya diakses lewat API libIEC61850; update nilai dilindungi
@@ -81,10 +143,12 @@ impl Inner {
             CtlAct::Auto => Act::Auto { st: self.pt(&s.do_ref, "stVal")? },
         };
         let ctl = Box::new(Ctl {
-            name: format!("{}{}/{}", self.name, self.ld, s.do_ref),
+            name: s.do_ref.clone(),
             server: self.server,
+            ctx: Arc::clone(&self.ctx),
             loc: self.attr(&format!("{}.stVal", s.loc_ref))?,
             interlock: s.interlock,
+            enhanced: s.enhanced,
             act,
         });
         if s.controllable {
@@ -94,6 +158,7 @@ impl Inner {
             unsafe {
                 ffi::IedServer_setPerformCheckHandler(self.server, d, Some(on_check), p);
                 ffi::IedServer_setControlHandler(self.server, d, Some(on_operate), p);
+                ffi::IedServer_setSelectStateChangedHandler(self.server, d, Some(on_select_state), p);
             }
         }
         self.ctls.push(ctl);
@@ -103,8 +168,8 @@ impl Inner {
 
 impl Drop for Inner {
     fn drop(&mut self) {
-        // SAFETY: urutan wajib: stop -> destroy server -> destroy model. self.ctls di-drop sesudah ini,
-        // jadi tidak ada handler yang masih bisa dipanggil saat Box-nya dibebaskan.
+        // SAFETY: urutan wajib: stop -> destroy server -> destroy model. self.ctls & self.ctx di-drop
+        // sesudah ini, jadi tidak ada handler yang masih bisa dipanggil saat parameternya dibebaskan.
         unsafe {
             ffi::IedServer_stop(self.server);
             ffi::IedServer_destroy(self.server);
@@ -166,13 +231,90 @@ fn get_int(server: ffi::IedServer, a: &Attr) -> i32 {
     unsafe { ffi::IedServer_getInt32AttributeValue(server, a.0) }
 }
 
+fn get_time(server: ffi::IedServer, a: &Attr) -> u64 {
+    // SAFETY: server & attr valid, attr Timestamp
+    unsafe { ffi::IedServer_getUTCTimeAttributeValue(server, a.0) }
+}
+
+fn dbpos_name(d: ffi::Dbpos) -> &'static str {
+    match d {
+        ffi::DBPOS_ON => "close",
+        ffi::DBPOS_OFF => "open",
+        ffi::DBPOS_INTERMEDIATE_STATE => "intermediate",
+        _ => "bad",
+    }
+}
+
+/// Quality untuk UI: `{"raw": u16, "text": "good" | "invalid+oldData" | ...}`
+fn quality(server: ffi::IedServer, a: &Attr) -> Value {
+    // SAFETY: server & attr valid, attr Quality (bit-string)
+    let q = unsafe { ffi::Quality_fromMmsValue(ffi::IedServer_getAttributeValue(server, a.0)) } as u32;
+    let mut t = vec![match q & 3 {
+        ffi::QUALITY_VALIDITY_GOOD => "good",
+        ffi::QUALITY_VALIDITY_INVALID => "invalid",
+        ffi::QUALITY_VALIDITY_QUESTIONABLE => "questionable",
+        _ => "reserved",
+    }];
+    for (bit, name) in [
+        (ffi::QUALITY_DETAIL_OVERFLOW, "overflow"),
+        (ffi::QUALITY_DETAIL_OUT_OF_RANGE, "outOfRange"),
+        (ffi::QUALITY_DETAIL_BAD_REFERENCE, "badReference"),
+        (ffi::QUALITY_DETAIL_OSCILLATORY, "oscillatory"),
+        (ffi::QUALITY_DETAIL_FAILURE, "failure"),
+        (ffi::QUALITY_DETAIL_OLD_DATA, "oldData"),
+        (ffi::QUALITY_DETAIL_INCONSISTENT, "inconsistent"),
+        (ffi::QUALITY_DETAIL_INACCURATE, "inaccurate"),
+        (ffi::QUALITY_SOURCE_SUBSTITUTED, "substituted"),
+        (ffi::QUALITY_TEST, "test"),
+        (ffi::QUALITY_OPERATOR_BLOCKED, "operatorBlocked"),
+    ] {
+        if q & bit != 0 {
+            t.push(name);
+        }
+    }
+    json!({ "raw": q, "text": t.join("+") })
+}
+
+impl View {
+    fn new(inner: &Inner, c: &model::Component) -> Result<Self, String> {
+        let kind = match (c.refs(), &c.kind) {
+            (Refs::Cb { xcbr, cswi }, _) => VKind::Cb {
+                pos: [inner.pt(&format!("{xcbr}.Pos"), "stVal")?, inner.pt(&format!("{cswi}.Pos"), "stVal")?],
+                loc: [inner.pt(&format!("{xcbr}.Loc"), "stVal")?, inner.pt(&format!("{cswi}.Loc"), "stVal")?],
+                q: inner.attr(&format!("{xcbr}.Pos.q"))?,
+            },
+            (Refs::Tap { yltc, atcc }, model::Kind::TapChanger { min, max, .. }) => VKind::Tap {
+                pos: inner.pt(&format!("{atcc}.TapChg"), "valWTr.posVal")?,
+                mirror: inner.pt(&format!("{yltc}.TapPos"), "stVal")?,
+                auto: inner.pt(&format!("{atcc}.Auto"), "stVal")?,
+                loc: inner.pt(&format!("{atcc}.Loc"), "stVal")?,
+                q: inner.attr(&format!("{yltc}.TapPos.q"))?,
+                min: *min,
+                max: *max,
+            },
+            (Refs::Point { do_ref, value_ref }, k) => VKind::Point {
+                v: inner.attr(&value_ref)?,
+                q: inner.attr(&format!("{do_ref}.q"))?,
+                t: inner.attr(&format!("{do_ref}.t"))?,
+                is_bool: matches!(k, model::Kind::Telesignal { .. }),
+                value_ref,
+            },
+            _ => unreachable!("refs() sesuai kind"),
+        };
+        Ok(Self { id: c.id.clone(), desc: c.describe(), kind })
+    }
+}
+
 /// Objek kontrol: parameter handler check/operate libIEC61850.
 struct Ctl {
-    /// reference lengkap DO, untuk log
+    /// DO relatif ke LD, untuk log
     name: String,
     server: ffi::IedServer,
+    ctx: Arc<IedCtx>,
     loc: Attr,
     interlock: bool,
+    /// security enhanced: libIEC61850 mengirim CommandTermination
+    enhanced: bool,
     act: Act,
 }
 
@@ -353,14 +495,26 @@ fn tap_step(val: *const ffi::MmsValue) -> Option<i32> {
     }
 }
 
-/// orIdent + orCat pengirim perintah, untuk log
-fn origin(action: ffi::ControlAction) -> String {
+/// Ringkasan perintah untuk log: `CSWI1.Pos select close`, `ATCC1.TapChg operate raise`
+fn what(ctl: &Ctl, action: ffi::ControlAction, val: *const ffi::MmsValue) -> String {
+    // SAFETY: action valid selama handler
+    let op = if unsafe { ffi::ControlAction_isSelect(action) } { "select" } else { "operate" };
+    if val.is_null() {
+        format!("{} {op}", ctl.name)
+    } else {
+        format!("{} {op} {}", ctl.name, ctl.describe(val))
+    }
+}
+
+/// orIdent + orCat + alamat client asli, untuk log
+fn origin(ctl: &Ctl, action: ffi::ControlAction) -> String {
     let mut n = 0;
     // SAFETY: action valid selama handler; buffer orIdent milik library, dibaca sebelum return
     unsafe {
         let p = ffi::ControlAction_getOrIdent(action, &mut n);
         let ident = if p.is_null() { "-".into() } else { String::from_utf8_lossy(std::slice::from_raw_parts(p, n as usize)).into_owned() };
-        format!("orIdent={ident} orCat={}", ffi::ControlAction_getOrCat(action))
+        let from = ctl.ctx.peer(ffi::ControlAction_getClientConnection(action));
+        format!("orIdent={ident} orCat={} dari {from}", ffi::ControlAction_getOrCat(action))
     }
 }
 
@@ -373,13 +527,20 @@ unsafe extern "C" fn on_check(
 ) -> ffi::CheckHandlerResult {
     // SAFETY: p = Box<Ctl> dari add_ctl, hidup sampai server dihancurkan
     let ctl = unsafe { &*(p as *const Ctl) };
-    catch_unwind(AssertUnwindSafe(|| match ctl.check(val, interlock_check) {
-        Ok(()) => ffi::CONTROL_ACCEPTED,
-        Err((res, cause)) => {
-            // SAFETY: action valid selama handler
-            unsafe { ffi::ControlAction_setAddCause(action, cause) };
-            warn!("kontrol {} {} ditolak: {} ({})", ctl.name, ctl.describe(val), add_cause_name(cause), origin(action));
-            res
+    catch_unwind(AssertUnwindSafe(|| {
+        let ilk = if interlock_check { ", interlock-check" } else { "" };
+        match ctl.check(val, interlock_check) {
+            Ok(()) => {
+                ctl.ctx.event(Ev::Control, format!("{} diterima{ilk} ({})", what(ctl, action, val), origin(ctl, action)));
+                ffi::CONTROL_ACCEPTED
+            }
+            Err((res, cause)) => {
+                // SAFETY: action valid selama handler
+                unsafe { ffi::ControlAction_setAddCause(action, cause) };
+                let msg = format!("{} ditolak: {}{ilk} ({})", what(ctl, action, val), add_cause_name(cause), origin(ctl, action));
+                ctl.ctx.event(Ev::Control, msg);
+                res
+            }
         }
     }))
     .unwrap_or(ffi::CONTROL_HARDWARE_FAULT)
@@ -390,31 +551,135 @@ unsafe extern "C" fn on_operate(action: ffi::ControlAction, p: *mut c_void, val:
     let ctl = unsafe { &*(p as *const Ctl) };
     catch_unwind(AssertUnwindSafe(|| {
         let r = ctl.operate(val, test);
-        if r == ffi::CONTROL_RESULT_OK {
-            info!("kontrol {} {} selesai{} ({})", ctl.name, ctl.describe(val), if test { " [test]" } else { "" }, origin(action));
-        }
+        let term = match (ctl.enhanced, r) {
+            (_, ffi::CONTROL_RESULT_WAITING) => return r,
+            (true, ffi::CONTROL_RESULT_OK) => ", CommandTermination+",
+            (true, _) => ", CommandTermination-",
+            (false, _) => "",
+        };
+        let res = if r == ffi::CONTROL_RESULT_OK { "selesai" } else { "gagal" };
+        let test = if test { " [test]" } else { "" };
+        ctl.ctx.event(Ev::Control, format!("{} {res}{test}{term} ({})", what(ctl, action, val), origin(ctl, action)));
         r
     }))
     .unwrap_or(ffi::CONTROL_RESULT_FAILED)
 }
 
+/// Select batal karena cancel / sboTimeout / client putus (select & operate sudah tercatat di handler lain).
+unsafe extern "C" fn on_select_state(action: ffi::ControlAction, p: *mut c_void, _selected: bool, reason: ffi::SelectStateChangedReason) {
+    // SAFETY: p = Box<Ctl> dari add_ctl, hidup sampai server dihancurkan
+    let ctl = unsafe { &*(p as *const Ctl) };
+    let why = match reason {
+        ffi::SELECT_STATE_REASON_CANCELED => "cancel",
+        ffi::SELECT_STATE_REASON_TIMEOUT => "sboTimeout habis",
+        ffi::SELECT_STATE_REASON_DISCONNECTED => "client putus",
+        _ => return,
+    };
+    let _ = catch_unwind(AssertUnwindSafe(|| ctl.ctx.event(Ev::Control, format!("{} unselect: {why} ({})", ctl.name, origin(ctl, action)))));
+}
+
+unsafe extern "C" fn on_rcb(
+    p: *mut c_void,
+    rcb: *mut ffi::ReportControlBlock,
+    conn: ffi::ClientConnection,
+    event: ffi::IedServer_RCBEventType,
+    _param: *const c_char,
+    _err: ffi::MmsDataAccessError,
+) {
+    // SAFETY: p = Arc<IedCtx> milik Inner, hidup sampai server dihancurkan; rcb valid selama handler
+    let ctx = unsafe { &*(p as *const IedCtx) };
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        let name = unsafe { CStr::from_ptr(ffi::ReportControlBlock_getName(rcb)) }.to_string_lossy().into_owned();
+        match event {
+            // libIEC61850 juga mem-buffer report untuk BRCB yang disable; yang dihitung hanya RCB aktif (= terkirim)
+            ffi::RCB_EVENT_REPORT_CREATED if unsafe { ffi::ReportControlBlock_getRptEna(rcb) } => {
+                let mut r = lock(&ctx.reports);
+                match r.iter_mut().find(|(n, _)| *n == name) {
+                    Some((_, c)) => *c += 1,
+                    None => r.push((name, 1)),
+                }
+            }
+            ffi::RCB_EVENT_ENABLE => {
+                let who = ctx.peer(conn);
+                let kind = if unsafe { ffi::ReportControlBlock_isBuffered(rcb) } { "BRCB" } else { "URCB" };
+                let ds = if name.contains("ST") { "DS_ST" } else { "DS_MX" };
+                ctx.event(Ev::Rcb, format!("{name} ({kind}, dataset {ds}) di-enable oleh {who}"));
+                let mut r = lock(&ctx.rcbs);
+                r.retain(|(n, _)| *n != name);
+                r.push((name, who));
+            }
+            ffi::RCB_EVENT_DISABLE => {
+                ctx.flush_reports(); // report sebelum disable tercatat lebih dulu
+                lock(&ctx.rcbs).retain(|(n, _)| *n != name);
+                let who = if conn.is_null() { "(client putus)".into() } else { format!("oleh {}", ctx.peer(conn)) };
+                ctx.event(Ev::Rcb, format!("{name} di-disable {who}"));
+            }
+            ffi::RCB_EVENT_GI => ctx.event(Ev::Rcb, format!("{name} GI oleh {}", ctx.peer(conn))),
+            ffi::RCB_EVENT_OVERFLOW => ctx.event(Ev::Rcb, format!("{name} buffer overflow")),
+            _ => {}
+        }
+    }));
+}
+
 pub struct Ied {
     pub name: String,
     pub port: u16,
-    #[allow(dead_code)] // dipegang supaya server hidup; dibaca lewat API set nilai mulai fase 5
+    pub ctx: Arc<IedCtx>,
     inner: Arc<Inner>,
+    /// Titik data + state generator (dipakai bersama task generator & ubah manual dari UI)
+    points: Arc<Mutex<Vec<Live>>>,
+    /// Tampilan per komponen, urut sesuai konfigurasi
+    views: Vec<View>,
+    /// Urutan kartu di UI (id komponen). ponytail: hanya di memori; disimpan bersama autosave di fase 8
+    order: Mutex<Vec<String>>,
     task: JoinHandle<()>,
+    proxy: JoinHandle<()>,
+}
+
+/// Satu komponen untuk UI: deskripsi statis + atribut untuk baca nilai live & ubah manual.
+struct View {
+    id: String,
+    desc: Value,
+    kind: VKind,
+}
+
+enum VKind {
+    /// pos: [XCBR.Pos, CSWI.Pos], loc: [XCBR.Loc, CSWI.Loc]
+    Cb { pos: [Pt; 2], loc: [Pt; 2], q: Attr },
+    /// pos: ATCC.TapChg posVal, mirror: YLTC.TapPos
+    Tap { pos: Pt, mirror: Pt, auto: Pt, loc: Pt, q: Attr, min: i32, max: i32 },
+    /// telesignal (bool) / telemetry (float); state generator dicari lewat `value_ref`
+    Point { value_ref: String, v: Attr, q: Attr, t: Attr, is_bool: bool },
 }
 
 impl Ied {
-    /// Validasi, bangun model, isi nilai awal, pasang handler kontrol, listen MMS di `0.0.0.0:port`,
-    /// lalu jalankan generator. Harus dipanggil di dalam runtime tokio.
-    pub fn start(cfg: &IedConfig) -> Result<Self, String> {
+    /// Validasi, bangun model, isi nilai awal, pasang handler, jalankan IedServer di 127.0.0.1:<acak>
+    /// dengan proxy di `0.0.0.0:port`, lalu jalankan generator. Harus dipanggil di dalam runtime tokio.
+    pub fn start(cfg: &IedConfig, events: Arc<Events>) -> Result<Self, String> {
         model::validate(cfg)?;
+        // Port publik dipegang proxy; gagal di sini = port bentrok, sebelum model dibuat
+        let public = std::net::TcpListener::bind(("0.0.0.0", cfg.port))
+            .and_then(|l| l.set_nonblocking(true).map(|_| l))
+            .and_then(tokio::net::TcpListener::from_std)
+            .map_err(|e| format!("IED {}: port MMS {} tidak bisa dipakai: {e}", cfg.name, cfg.port))?;
+        // ponytail: port internal dipilih OS lalu dilepas sebelum IedServer_start (jeda kecil, bisa bentrok);
+        // ganti ke socket yang diwariskan kalau pernah terjadi
+        let internal = std::net::TcpListener::bind(("127.0.0.1", 0))
+            .and_then(|l| l.local_addr())
+            .map_err(|e| format!("IED {}: tidak dapat port internal: {e}", cfg.name))?
+            .port();
+
         let built = model::build(cfg);
         // SAFETY: model valid dari build(); server memegang referensi model sampai destroy.
         let server = unsafe { ffi::IedServer_create(built.model) };
-        let mut inner = Inner { name: cfg.name.clone(), ld: cfg.ld.clone(), model: built.model, server, ctls: Vec::new() };
+        let ctx = Arc::new(IedCtx {
+            name: cfg.name.clone(),
+            events,
+            clients: Mutex::new(Vec::new()),
+            rcbs: Mutex::new(Vec::new()),
+            reports: Mutex::new(Vec::new()),
+        });
+        let mut inner = Inner { name: cfg.name.clone(), ld: cfg.ld.clone(), model: built.model, server, ctls: Vec::new(), ctx: Arc::clone(&ctx) };
 
         for (r, v) in &built.fixed {
             inner.write(&inner.attr(r)?, *v, None);
@@ -428,30 +693,199 @@ impl Ied {
         for p in built.points {
             let rt = Live::new(&inner, p)?;
             inner.write(&rt.attr, rt.p.init, Some(&rt.t));
-            if rt.p.gen.mode != Mode::Manual || rt.follow.is_some() {
-                live.push(rt);
-            }
+            live.push(rt);
         }
+        let views = cfg.components.iter().map(|c| View::new(&inner, c)).collect::<Result<Vec<_>, _>>()?;
         for s in &built.ctls {
             inner.add_ctl(s)?;
         }
+        let local = CString::new("127.0.0.1").expect("tanpa NUL");
+        // SAFETY: server valid; parameter RCB = IedCtx yang dipegang Inner sampai server dihancurkan
+        unsafe {
+            ffi::IedServer_setRCBEventHandler(server, Some(on_rcb), Arc::as_ptr(&ctx) as *mut c_void);
+            ffi::IedServer_setLocalIpAddress(server, local.as_ptr());
+            ffi::IedServer_start(server, internal.into());
+        }
         let inner = Arc::new(inner);
 
-        // IedServer_isRunning tetap true walau bind gagal, jadi cek port dulu.
-        // ponytail: ada jeda kecil antara cek dan start; hilang di fase 5 (proxy memegang port publik)
-        std::net::TcpListener::bind(("0.0.0.0", cfg.port))
-            .map_err(|e| format!("IED {}: port MMS {} tidak bisa dipakai: {e}", cfg.name, cfg.port))?;
-        // SAFETY: server valid
-        unsafe { ffi::IedServer_start(server, cfg.port.into()) };
+        let points = Arc::new(Mutex::new(live));
+        let task = tokio::spawn(generate(Arc::clone(&inner), Arc::clone(&points)));
+        let proxy = tokio::spawn(proxy::run(public, internal, Arc::clone(&ctx)));
+        let order = Mutex::new(views.iter().map(|v| v.id.clone()).collect());
+        Ok(Self { name: cfg.name.clone(), port: cfg.port, ctx, inner, points, views, order, task, proxy })
+    }
 
-        let task = tokio::spawn(generate(Arc::clone(&inner), live));
-        Ok(Self { name: cfg.name.clone(), port: cfg.port, inner, task })
+    /// Nilai live satu komponen: posisi/nilai, auto, local, quality, timestamp
+    fn live(&self, v: &View) -> Value {
+        let s = self.inner.server;
+        match &v.kind {
+            VKind::Cb { pos, loc, q } => json!({
+                "id": v.id, "pos": dbpos_name(dbpos(s, &pos[0].v)), "local": get_bool(s, &loc[1].v),
+                "q": quality(s, q), "t": get_time(s, &pos[0].t),
+            }),
+            VKind::Tap { pos, auto, loc, q, mirror, .. } => json!({
+                "id": v.id, "pos": get_int(s, &pos.v), "auto": get_bool(s, &auto.v), "local": get_bool(s, &loc.v),
+                "q": quality(s, q), "t": get_time(s, &mirror.t),
+            }),
+            VKind::Point { value_ref, v: a, q, t, is_bool } => {
+                let auto = lock(&self.points).iter().find(|l| l.p.value_ref == *value_ref).map(|l| l.auto);
+                let value = if *is_bool {
+                    json!(get_bool(s, a))
+                } else {
+                    // SAFETY: server & attr valid, attr FLOAT32
+                    let f = unsafe { ffi::IedServer_getFloatAttributeValue(s, a.0) } as f64;
+                    json!((f * 1e4).round() / 1e4) // buang noise f32 (50.099998 -> 50.1)
+                };
+                json!({ "id": v.id, "value": value, "auto": auto, "q": quality(s, q), "t": get_time(s, t) })
+            }
+        }
+    }
+
+    /// Nilai live semua komponen (untuk `value_changed`)
+    pub fn live_values(&self) -> Vec<Value> {
+        self.views.iter().map(|v| self.live(v)).collect()
+    }
+
+    /// Event `components`: konfigurasi + nilai live, urut sesuai urutan kartu
+    pub fn components_json(&self) -> Value {
+        let order = lock(&self.order).clone();
+        let list = order
+            .iter()
+            .filter_map(|id| self.views.iter().find(|v| v.id == *id))
+            .map(|v| {
+                let mut d = v.desc.clone();
+                if let (Some(d), Value::Object(l)) = (d.as_object_mut(), self.live(v)) {
+                    d.extend(l);
+                }
+                d
+            })
+            .collect();
+        json!({ "ied": self.name, "components": Value::Array(list) })
+    }
+
+    /// Urutan kartu baru; harus berisi semua id komponen tepat sekali.
+    pub fn set_order(&self, ids: Vec<String>) -> Result<(), String> {
+        let mut sorted = ids.clone();
+        sorted.sort();
+        let mut all: Vec<String> = self.views.iter().map(|v| v.id.clone()).collect();
+        all.sort();
+        if sorted != all {
+            return Err("urutan harus berisi semua id komponen tepat sekali".into());
+        }
+        *lock(&self.order) = ids;
+        Ok(())
+    }
+
+    /// Ubah manual dari UI / API (dicatat sebagai kejadian `manual`).
+    /// CB & tap: `{"action": "open"|"close"|"raise"|"lower"}`, `{"local": bool}`, tap `{"auto": bool}`.
+    /// Telesignal/telemetry: `{"value": bool|number}` (mode manual), `{"auto": bool}`.
+    pub fn set(&self, id: &str, cmd: &Value) -> Result<String, String> {
+        let v = self.views.iter().find(|v| v.id == id).ok_or_else(|| format!("komponen {id} tidak ada di {}", self.name))?;
+        let s = self.inner.server;
+        let remote = |id: &str| format!("{id} mode Remote: pindah ke Local dulu untuk operasi dari UI");
+        let lr = |l: bool| if l { "Local" } else { "Remote" };
+        let msg = match &v.kind {
+            VKind::Cb { pos, loc, .. } => {
+                if let Some(l) = cmd["local"].as_bool() {
+                    loc.iter().for_each(|p| set(s, p, Val::Bool(l)));
+                    format!("{id} -> {}", lr(l))
+                } else {
+                    let (target, name) = match cmd["action"].as_str() {
+                        Some("open") => (ffi::DBPOS_OFF, "open"),
+                        Some("close") => (ffi::DBPOS_ON, "close"),
+                        _ => return Err("aksi CB harus open / close".into()),
+                    };
+                    // seperti acuan: operasi di panel hanya saat Local (Remote = dikendalikan SCADA/FEP)
+                    if !get_bool(s, &loc[1].v) {
+                        return Err(remote(id));
+                    }
+                    pos.iter().for_each(|p| set(s, p, Val::Dbpos(target)));
+                    format!("{id} {name}")
+                }
+            }
+            VKind::Tap { pos, mirror, auto, loc, min, max, .. } => {
+                if let Some(l) = cmd["local"].as_bool() {
+                    set(s, loc, Val::Bool(l));
+                    format!("{id} -> {}", lr(l))
+                } else if !get_bool(s, &loc.v) {
+                    return Err(remote(id));
+                } else if let Some(a) = cmd["auto"].as_bool() {
+                    set(s, auto, Val::Bool(a));
+                    format!("{id} auto={a}")
+                } else {
+                    let p = get_int(s, &pos.v);
+                    let n = match cmd["action"].as_str() {
+                        Some("raise") => p + 1,
+                        Some("lower") => p - 1,
+                        _ => return Err("aksi tap harus raise / lower".into()),
+                    };
+                    if !(*min..=*max).contains(&n) {
+                        return Err(format!("{id}: posisi {n} di luar batas {min}..{max}"));
+                    }
+                    set_tap(s, pos, mirror, n);
+                    format!("{id} {} -> {n}", cmd["action"].as_str().unwrap_or_default())
+                }
+            }
+            VKind::Point { value_ref, is_bool, .. } => {
+                let mut pts = lock(&self.points);
+                let l = pts.iter_mut().find(|l| l.p.value_ref == *value_ref).ok_or("titik tidak ditemukan")?;
+                if let Some(a) = cmd["auto"].as_bool() {
+                    if l.p.gen.mode == Mode::Manual {
+                        return Err(format!("{id} tidak punya generator (mode manual), auto tidak bisa dinyalakan"));
+                    }
+                    l.auto = a;
+                    format!("{id} auto={a}")
+                } else {
+                    if l.auto {
+                        return Err(format!("{id} mode auto: matikan auto dulu untuk ubah nilai manual"));
+                    }
+                    let n = if *is_bool {
+                        cmd["value"].as_bool().map(|b| b as u8 as f64)
+                    } else {
+                        cmd["value"].as_f64().filter(|f| f.is_finite())
+                    };
+                    let n = n.ok_or_else(|| format!("nilai untuk {id} tidak valid: {}", cmd["value"]))?;
+                    l.own = n; // ditulis generator pada tick berikutnya (tetap mematuhi follow CB)
+                    format!("{id} = {}", cmd["value"])
+                }
+            }
+        };
+        self.ctx.event(Ev::Manual, format!("{msg} (dari UI)"));
+        Ok(msg)
+    }
+
+    /// Status untuk `GET /ieds` & event Socket.IO `ieds`.
+    pub fn info(&self) -> Value {
+        let clients = lock(&self.ctx.clients).clone();
+        let rcbs = lock(&self.ctx.rcbs).clone();
+        // "report" = ada RCB aktif; client terhubung tanpa RCB aktif = kemungkinan polling
+        let mode = match (rcbs.is_empty(), clients.is_empty()) {
+            (false, _) => "report",
+            (true, false) => "polling",
+            (true, true) => "idle",
+        };
+        json!({
+            "name": self.name,
+            "port": self.port,
+            "status": "running",
+            "components": self.views.len(),
+            "client_count": clients.len(),
+            "clients": clients.iter().map(|c| json!({ "addr": c.peer.to_string(), "since": c.since_ms })).collect::<Vec<_>>(),
+            // pembanding: koneksi yang dilihat libIEC61850 (harus sama dengan client_count)
+            // SAFETY: server valid selama inner hidup
+            "ied_connections": unsafe { ffi::IedServer_getNumberOfOpenConnections(self.inner.server) },
+            "mode": mode,
+            "rcbs": rcbs.iter().map(|(r, c)| json!({ "rcb": r, "client": c })).collect::<Vec<_>>(),
+            "last_event": self.ctx.events.last_ts(&self.name),
+        })
     }
 }
 
 impl Drop for Ied {
     fn drop(&mut self) {
-        // Inner (server) dihancurkan setelah task generator ikut selesai (Arc terakhir)
+        // Proxy berhenti (koneksi client ditutup); Inner (server) dihancurkan setelah task generator
+        // ikut selesai (Arc terakhir)
+        self.proxy.abort();
         self.task.abort();
     }
 }
@@ -467,6 +901,8 @@ struct Live {
     /// nilai yang sekarang ada di server
     cur: f64,
     due: Instant,
+    /// generator jalan (mode != manual dan auto tidak dimatikan dari UI)
+    auto: bool,
 }
 
 impl Live {
@@ -485,6 +921,7 @@ impl Live {
             own: v,
             cur: v,
             due: Instant::now() + Duration::from_millis(p.gen.interval_ms),
+            auto: p.gen.mode != Mode::Manual,
             p,
         })
     }
@@ -498,26 +935,28 @@ impl Live {
     }
 }
 
-async fn generate(inner: Arc<Inner>, mut points: Vec<Live>) {
+async fn generate(inner: Arc<Inner>, points: Arc<Mutex<Vec<Live>>>) {
     // (tap, jatuh tempo, arah +1/-1)
     let mut taps: Vec<(&Ctl, Instant, i32)> =
         inner.ctls.iter().filter(|c| matches!(c.act, Act::Tap { .. })).map(|c| (&**c, Instant::now(), 1)).collect();
     let cbs: Vec<&Ctl> = inner.ctls.iter().filter(|c| matches!(c.act, Act::Cb { .. })).map(|c| &**c).collect();
-    if points.is_empty() && taps.is_empty() && cbs.is_empty() {
-        return;
-    }
     let start = Instant::now();
+    let mut flush_due = start + REPORT_FLUSH;
     let mut rng = Rng::new(now_ms());
     let mut tick = tokio::time::interval(TICK);
     loop {
         tick.tick().await;
         let now = Instant::now();
+        if now >= flush_due {
+            inner.ctx.flush_reports();
+            flush_due = now + REPORT_FLUSH;
+        }
         // dulu, supaya titik yang follow CB langsung melihat posisi akhir
         for c in &cbs {
             c.finish_travel(now);
         }
-        for p in &mut points {
-            if p.p.gen.mode != Mode::Manual && now >= p.due {
+        for p in lock(&points).iter_mut() {
+            if p.auto && now >= p.due {
                 p.own = p.p.gen.next(p.own, (now - start).as_secs_f64(), &mut rng);
                 p.due = now + Duration::from_millis(p.p.gen.interval_ms);
             }
@@ -546,7 +985,7 @@ async fn generate(inner: Arc<Inner>, mut points: Vec<Live>) {
     }
 }
 
-fn now_ms() -> u64 {
+pub fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
 }
 
@@ -599,8 +1038,8 @@ mod tests {
                 comp("an", Kind::Telemetry { mx: Mx::preset("generic", 1, "3").unwrap(), value: 1.5, gen: Gen::manual(), follow_cb: None }),
             ],
         };
-        let ied = Ied::start(&cfg).expect("start");
-        assert!(Ied::start(&cfg).is_err(), "port sama tidak boleh dipakai dua kali");
+        let ied = Ied::start(&cfg, Arc::new(Events::new())).expect("start");
+        assert!(Ied::start(&cfg, Arc::new(Events::new())).is_err(), "port sama tidak boleh dipakai dua kali");
 
         assert_eq!(pos(&ied, "XCBR1.Pos.stVal"), ffi::DBPOS_ON);
         assert_eq!(get_f(&ied, "GGIO1.AnIn3.mag.f"), 1.5); // manual: tetap
@@ -641,7 +1080,7 @@ mod tests {
                 comp("tap2", tap(2, true, 100)),
             ],
         };
-        let ied = Ied::start(&cfg).expect("start");
+        let ied = Ied::start(&cfg, Arc::new(Events::new())).expect("start");
         let wait = Duration::from_secs(3);
         let ctl = move |r: &str, v, ilk| {
             let r = format!("CTLLD0/{r}");
@@ -733,5 +1172,144 @@ mod tests {
             seen.insert(p);
         }
         assert!(seen.contains(&-1) && seen.contains(&1), "tap auto harus bolak-balik: {seen:?}");
+    }
+
+    /// Fase 5: banyak IED di belakang proxy, jumlah client, RCB aktif, dan log kejadian.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn banyak_ied_client_dan_log() {
+        let events = Arc::new(Events::new());
+        let fast = Gen { mode: Mode::Random, interval_ms: 100, min: 0.0, max: 100.0, scale: 0.0, step: 1.0, period_s: 1.0 };
+        let ied = |name: &str, port| IedConfig {
+            name: name.into(),
+            ld: "LD0".into(),
+            port,
+            components: vec![
+                comp("cb1", Kind::CircuitBreaker(cb(1, true, CtlModel::SboEnhanced))),
+                comp("mw", Kind::Telemetry { mx: Mx::preset("MW", 1, "").unwrap(), value: 0.0, gen: fast.clone(), follow_cb: None }),
+            ],
+        };
+        let ieds: Vec<Ied> =
+            [("MA", 10111), ("MB", 10112), ("MC", 10113)].iter().map(|(n, p)| Ied::start(&ied(n, *p), Arc::clone(&events)).unwrap()).collect();
+        let (a, b, c) = (&ieds[0], &ieds[1], &ieds[2]);
+        let conn = |port| std::thread::spawn(move || Conn::connect("127.0.0.1", port).unwrap()).join().unwrap();
+        let (a1, a2, b1) = (conn(10111), conn(10111), conn(10112));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // jumlah client: dihitung proxy, dicocokkan dengan koneksi yang dilihat libIEC61850
+        for (ied, n) in [(a, 2), (b, 1), (c, 0)] {
+            let i = ied.info();
+            assert_eq!(i["client_count"], n, "{}", ied.name);
+            assert_eq!(i["ied_connections"], n, "{}", ied.name);
+        }
+        assert_eq!(a.info()["mode"], "polling");
+        assert_eq!(c.info()["mode"], "idle");
+
+        // RCB enable oleh client a1 -> mode report, client tercatat dengan alamat asli
+        let addrs: Vec<String> = a.info()["clients"].as_array().unwrap().iter().map(|c| c["addr"].as_str().unwrap().to_string()).collect();
+        let rcb = CString::new("MALD0/LLN0.BR.brcbST01").unwrap();
+        let a1_raw = a1.0 as usize;
+        std::thread::spawn(move || {
+            let con = a1_raw as ffi::IedConnection;
+            let mut err = 0;
+            // SAFETY: koneksi a1 hidup sampai akhir test; objek RCB dihancurkan di sini
+            unsafe {
+                let r = ffi::IedConnection_getRCBValues(con, &mut err, rcb.as_ptr(), std::ptr::null_mut());
+                assert_eq!(err, ffi::IED_ERROR_OK);
+                ffi::ClientReportControlBlock_setRptEna(r, true);
+                ffi::IedConnection_setRCBValues(con, &mut err, r, ffi::RCB_ELEMENT_RPT_ENA, true);
+                assert_eq!(err, ffi::IED_ERROR_OK);
+                ffi::ClientReportControlBlock_destroy(r);
+            }
+        })
+        .join()
+        .unwrap();
+        let i = a.info();
+        assert_eq!(i["mode"], "report");
+        assert_eq!(i["rcbs"][0]["rcb"], "brcbST01");
+        assert!(addrs.contains(&i["rcbs"][0]["client"].as_str().unwrap().to_string()), "RCB harus tercatat dengan alamat client asli: {i}");
+
+        // kontrol lewat koneksi a2 -> log diterima & selesai, alamat = salah satu client asli
+        let r = std::thread::spawn(move || control(&a2, "MALD0/CSWI1.Pos", CtlVal::Bool(false), false, Duration::from_secs(3))).join().unwrap();
+        assert!(r.is_ok(), "{r:?}");
+        let ctl: Vec<String> = events.query(Some("MA"), Some(Ev::Control), 10).into_iter().map(|e| e.msg).collect();
+        assert!(ctl.iter().any(|m| m.contains("CSWI1.Pos select open diterima")), "{ctl:?}");
+        let done = ctl.iter().find(|m| m.contains("operate open selesai, CommandTermination+")).expect("operate selesai tercatat");
+        assert!(addrs.iter().any(|a| done.contains(&format!("dari {a})"))), "alamat client asli: {done} vs {addrs:?}");
+
+        // report dikelompokkan per detik (CB berubah + MW random tiap 100 ms)
+        tokio::time::sleep(Duration::from_millis(1300)).await;
+        let rep = events.query(Some("MA"), Some(Ev::Report), 5);
+        assert!(rep.iter().any(|e| e.msg.contains("brcbST01×")), "{rep:?}");
+        assert!(rep.iter().all(|e| !e.msg.contains("brcbMX01")), "RCB yang tidak di-enable tidak boleh terhitung: {rep:?}");
+
+        // client putus -> jumlah turun, RCB ikut disable, tercatat
+        drop((a1, b1));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(a.info()["client_count"], 0);
+        assert_eq!(b.info()["client_count"], 0);
+        assert_eq!(a.info()["mode"], "idle");
+        let con: Vec<String> = events.query(Some("MA"), Some(Ev::Connection), 10).into_iter().map(|e| e.msg).collect();
+        assert!(con.iter().filter(|m| m.starts_with("client konek")).count() >= 2 && con.iter().any(|m| m.starts_with("client putus")), "{con:?}");
+        assert!(events.query(Some("MA"), Some(Ev::Rcb), 10).iter().any(|e| e.msg.contains("brcbST01 di-disable")));
+    }
+
+    /// Fase 6: ubah manual dari UI, mode auto, aturan Local/Remote, urutan kartu.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ubah_manual_dari_ui() {
+        let events = Arc::new(Events::new());
+        let rnd = Gen { mode: Mode::Random, interval_ms: 100, min: 10.0, max: 20.0, scale: 0.0, step: 1.0, period_s: 1.0 };
+        let cfg = IedConfig {
+            name: "UI".into(),
+            ld: "LD0".into(),
+            port: 10121,
+            components: vec![
+                comp("cb1", Kind::CircuitBreaker(cb(1, false, CtlModel::SboEnhanced))),
+                comp("tap1", Kind::TapChanger { inst: 1, pos: 1, min: 1, max: 2, ctl: CtlModel::DirectEnhanced, local: false, auto: false, interval_ms: 1000 }),
+                comp("ts1", Kind::Telesignal { ggio: 1, ind: 1, value: false, gen: Gen::manual() }),
+                comp("mw", Kind::Telemetry { mx: Mx::preset("MW", 1, "").unwrap(), value: 15.0, gen: rnd, follow_cb: None }),
+            ],
+        };
+        let ied = Ied::start(&cfg, Arc::clone(&events)).unwrap();
+        let live = |id: &str| ied.live_values().into_iter().find(|v| v["id"] == id).unwrap();
+        let set = |id: &str, cmd: Value| ied.set(id, &cmd);
+
+        // CB: operasi dari UI hanya saat Local
+        assert!(set("cb1", json!({ "action": "close" })).unwrap_err().contains("Remote"));
+        set("cb1", json!({ "local": true })).unwrap();
+        set("cb1", json!({ "action": "close" })).unwrap();
+        assert_eq!(live("cb1")["pos"], "close");
+        assert_eq!(live("cb1")["local"], true);
+        assert_eq!(live("cb1")["q"]["text"], "good");
+
+        // tap: Local + batas
+        set("tap1", json!({ "local": true })).unwrap();
+        set("tap1", json!({ "action": "raise" })).unwrap();
+        assert_eq!(live("tap1")["pos"], 2);
+        assert!(set("tap1", json!({ "action": "raise" })).unwrap_err().contains("batas"));
+
+        // telesignal manual, telemetry auto -> harus dimatikan dulu
+        set("ts1", json!({ "value": true })).unwrap();
+        assert!(set("ts1", json!({ "auto": true })).unwrap_err().contains("generator"));
+        assert_eq!(live("mw")["auto"], true);
+        assert!(set("mw", json!({ "value": 42.5 })).unwrap_err().contains("auto"));
+        set("mw", json!({ "auto": false })).unwrap();
+        set("mw", json!({ "value": 42.5 })).unwrap();
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(live("ts1")["value"], true);
+        assert_eq!(live("mw")["value"], 42.5);
+        assert!(live("mw")["t"].as_u64().unwrap() > 0);
+
+        // urutan kartu
+        assert!(ied.set_order(vec!["mw".into(), "cb1".into()]).is_err());
+        ied.set_order(vec!["mw".into(), "ts1".into(), "tap1".into(), "cb1".into()]).unwrap();
+        let c = ied.components_json();
+        assert_eq!(c["components"][0]["id"], "mw");
+        assert_eq!(c["components"][0]["ref"], "MMXU1.TotW");
+        assert_eq!(c["components"][0]["unit"], "MW");
+        assert_eq!(c["components"][3]["ctl_model"], "sbo-enhanced");
+        assert_eq!(c["components"][3]["pos"], "close");
+
+        let manual = events.query(Some("UI"), Some(Ev::Manual), 20);
+        assert_eq!(manual.len(), 7, "{manual:?}"); // hanya 7 perubahan yang berhasil
     }
 }

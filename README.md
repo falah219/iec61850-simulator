@@ -18,10 +18,53 @@ docker compose up --build
 - Health check: http://localhost:6061/health
 
 - MMS (IEC 61850): `localhost:102`, IED `SIMIED1`, domain `SIMIED1LD0`
+- Banyak IED: isi `IED_COUNT=20` di `backend/.env` (salin dari `backend/.env.example`). IED ke-n bernama
+  `SIMIED<n>`, port `102` untuk SIMIED1 lalu `10102`, `10103`, ... (SIMIED20 = `10120`)
+- Status IED: http://localhost:6061/ieds, log kejadian: http://localhost:6061/events
 
 Build pertama backend lama (compile libIEC61850 + crate Rust), berikutnya cepat karena cache.
 
-## Isi IED contoh (sementara di kode, `backend/src/main.rs`)
+## UI (http://localhost:4061)
+
+- **Daftar IED**: port, status, jumlah client + alamatnya, mode (`report` + RCB aktif & client-nya /
+  `polling?` / `idle`), jumlah komponen, kejadian terakhir. Tombol **Buka** ke detail.
+- **Detail IED** (`#/ied/SIMIED1`, bisa di-bookmark): 3 kolom seperti acuan (CB & Tap Changer,
+  Telesignal, Telemetry), nilai real-time dengan badge quality dan timestamp `t`.
+- Ubah manual (dicatat sebagai kejadian `manual`):
+  - CB: Open/Close dan tap Raise/Lower/Auto **hanya saat Local** (seperti acuan: Remote = dikendalikan
+    SCADA/FEP). Switch L/R mengubah `Loc` (ikut report).
+  - Telesignal ON/OFF dan telemetry (input angka + slider) hanya saat tombol **A** (auto) mati.
+- Tombol drag-and-drop di kanan atas: atur urutan kartu (per kolom, disimpan di memori backend).
+
+Socket.IO dari UI: `subscribe_ied` / `unsubscribe_ied` (room per IED), `set_value` dan `update_order`
+(hasil lewat ack `{ok, message}`), `get_initial_data`. Ke UI: `ieds`, `components` (config + nilai),
+`value_changed` (hanya yang berubah, tiap 300 ms, hanya ke room IED itu), `event_log`, `error`.
+
+## Banyak IED, proxy, log kejadian
+
+Setiap IED: IedServer libIEC61850 listen di `127.0.0.1:<port acak>`, proxy TCP memegang port publik.
+Proxy menghitung client dan mencatat alamat client asli (IedServer hanya melihat `127.0.0.1`).
+Skenario hang / putus koneksi / delay memakai proxy ini di fase 7.
+
+`GET /ieds`: per IED `name`, `port`, `status`, `components`, `client_count` + `clients` (alamat, sejak),
+`ied_connections` (jumlah koneksi menurut libIEC61850, pembanding), `mode` (`report` = ada RCB aktif,
+`polling` = ada client tanpa RCB aktif, `idle`), `rcbs` (RCB aktif + client), `last_event`.
+
+`GET /events?ied=SIMIED1&type=control&limit=100`: log kejadian (ring buffer 5000, urut lama -> baru).
+
+| type | Isi |
+|---|---|
+| `connection` | client konek / putus (alamat asli, jumlah byte, jumlah client) |
+| `rcb` | RCB enable (BRCB/URCB, dataset, oleh client), disable, GI, buffer overflow |
+| `control` | select / operate diterima / ditolak + AddCause / selesai + CommandTermination, unselect (cancel, sboTimeout, client putus); dengan orIdent, orCat, alamat client |
+| `report` | jumlah report terkirim per RCB, dikelompokkan per detik |
+| `manual` | perubahan dari UI (CB open/close, L/R, tap, auto, nilai) |
+
+Socket.IO: `ieds` (dikirim saat terhubung dan setiap ada perubahan, maks 1x/detik), `event_log`
+(200 kejadian terakhir saat terhubung, lalu real-time). Semua kejadian juga ditulis ke log backend
+(`report` di level debug).
+
+## Isi IED contoh (sementara di kode, `backend/src/main.rs`, sama untuk semua IED)
 
 | Komponen | Reference | Generator |
 |---|---|---|
@@ -96,6 +139,14 @@ docker compose exec backend ./iec61850-simulator ctl 127.0.0.1 102 SIMIED1LD0/CS
 docker compose exec backend ./iec61850-simulator ctl 127.0.0.1 102 SIMIED1LD0/CSWI1.Pos close --interlock
 docker compose exec backend ./iec61850-simulator ctl 127.0.0.1 102 SIMIED1LD0/ATCC1.TapChg raise
 docker compose exec backend ./iec61850-simulator ctl 127.0.0.1 102 SIMIED1LD0/ATCC1.Auto true
+```
+
+Jumlah client & log dari luar container (client dari container lain masuk lewat port yang di-publish):
+
+```sh
+docker run --rm iec61850-sim-builder iec61850-simulator ctl host.docker.internal 10120 SIMIED20LD0/CSWI1.Pos open
+curl "http://localhost:6061/events?ied=SIMIED20&type=control"
+curl http://localhost:6061/ieds
 ```
 
 Pantau report (alat dev [tools/rptcheck/rptcheck.c](tools/rptcheck/rptcheck.c), tidak ikut image produksi):

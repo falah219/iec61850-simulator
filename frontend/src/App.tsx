@@ -1,30 +1,51 @@
 import { useEffect, useState } from 'react';
+import { Toaster, toast } from 'sonner';
 import socket from './socket';
+import type { IedInfo } from './types';
+import { IedList } from './pages/IedList';
+import { IedDetail } from './pages/IedDetail';
+
+/** Halaman dari URL hash: `#/ied/SIMIED1` = detail, selain itu daftar IED (bisa di-bookmark / dibagikan) */
+function routeIed() {
+  const m = window.location.hash.match(/^#\/ied\/(.+)$/);
+  return m ? decodeURIComponent(m[1]) : null;
+}
 
 function App() {
   const [connected, setConnected] = useState(socket.connected);
-  const [ieds, setIeds] = useState<unknown[]>([]);
+  const [ieds, setIeds] = useState<IedInfo[]>([]);
+  const [ied, setIed] = useState(routeIed);
 
   useEffect(() => {
     const onConnect = () => setConnected(true);
     const onDisconnect = () => setConnected(false);
+    const onError = (e: { message: string }) => toast.error(e.message);
+    const onHash = () => setIed(routeIed());
     socket.on('connect', onConnect);
     socket.on('disconnect', onDisconnect);
     socket.on('ieds', setIeds);
+    socket.on('error', onError);
+    window.addEventListener('hashchange', onHash);
     return () => {
       socket.off('connect', onConnect);
       socket.off('disconnect', onDisconnect);
       socket.off('ieds', setIeds);
+      socket.off('error', onError);
+      window.removeEventListener('hashchange', onHash);
     };
   }, []);
+
+  const go = (name: string | null) => {
+    window.location.hash = name ? `#/ied/${encodeURIComponent(name)}` : '';
+  };
 
   return (
     <div className="min-h-screen">
       <div className="flex justify-between items-center py-3 px-4 border-b">
-        <div className="flex items-center space-x-2">
+        <button className="flex items-center space-x-2" onClick={() => go(null)} title="Daftar IED">
           <img src="/iec.ico" alt="IEC Icon" className="w-6 h-6" />
           <p className="text-2xl font-bold">IEC 61850 Simulator</p>
-        </div>
+        </button>
         <span
           className={`flex items-center gap-2 px-3 py-1 rounded border text-sm font-medium ${
             connected ? 'border-green-600 text-green-700 bg-green-50' : 'border-red-600 text-red-700 bg-red-50'
@@ -34,7 +55,12 @@ function App() {
           {connected ? 'Tersambung' : 'Terputus'}
         </span>
       </div>
-      <p className="p-4 text-gray-500">{ieds.length} IED</p>
+      {ied ? (
+        <IedDetail name={ied} info={ieds.find((i) => i.name === ied)} back={() => go(null)} />
+      ) : (
+        <IedList ieds={ieds} open={go} />
+      )}
+      <Toaster richColors position="bottom-right" />
     </div>
   );
 }
