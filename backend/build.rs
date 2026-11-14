@@ -19,9 +19,14 @@ fn main() {
         .clang_arg(format!("-I{INCLUDE_DIR}"))
         .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
         .prepend_enum_name(false)
-        // Server + model dinamis + CDC (bukan API client seperti di FEP)
-        .allowlist_function("LibIEC61850_getVersionString|IedServer_.*|IedModel_.*|LogicalDevice_create|LogicalNode_create|CDC_.*_create|Dbpos_.*|DataSet_create|DataSetEntry_create|ReportControlBlock_create")
-        .allowlist_var("CDC_.*|TRG_OPT_.*|RPT_OPT_.*")
+        // Server + model dinamis + CDC + handler kontrol; API client kontrol untuk test & perintah `ctl`
+        .allowlist_function(
+            "LibIEC61850_getVersionString|IedServer_.*|IedModel_.*|LogicalDevice_create|LogicalNode_create|CDC_.*_create|Dbpos_.*\
+             |DataSet_create|DataSetEntry_create|DataAttribute_create|ReportControlBlock_create|ControlAction_.*\
+             |MmsValue_getBoolean|MmsValue_newBoolean|MmsValue_delete\
+             |IedConnection_create|IedConnection_connect|IedConnection_close|IedConnection_destroy|ControlObjectClient_.*",
+        )
+        .allowlist_var("CDC_.*|TRG_OPT_.*|RPT_OPT_.*|CONTROL_ORCAT_.*")
         .wrap_unsafe_ops(true)
         .generate()
         .expect("gagal generate binding libIEC61850");

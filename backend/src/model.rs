@@ -1,9 +1,13 @@
 //! Konfigurasi IED + validasi + bangun IedModel libIEC61850 secara dinamis (PLAN bagian 4).
 //!
 //! Satu LD (default `LD0`) berisi `LLN0` + `LPHD1`, lalu per komponen:
-//! - Circuit Breaker ke-n : `XCBR<n>` (Pos DPS, Loc SPS) + `CSWI<n>` (Pos DPC, Loc SPS)
-//! - Telesignal           : `GGIO<inst>.Ind<k>` (SPS), k = 1..N otomatis per instance GGIO
+//! - Circuit Breaker      : `XCBR<n>` (Pos DPS, Loc SPS) + `CSWI<n>` (Pos DPC dengan ctlModel [+ sboTimeout], Loc SPS)
+//! - Tap Changer          : `YLTC<n>.TapPos` (INS) + `ATCC<n>` (TapChg BSC raise/lower, Auto SPC, Loc SPS)
+//! - Telesignal           : `GGIO<inst>.Ind<k>` (SPS)
 //! - Telemetry            : LN/DO pilihan (preset atau custom), lihat [`Mx`]
+//!
+//! Semua nomor instance / Ind / AnIn disimpan di komponen (dikunci), tidak dihitung dari urutan.
+//! ponytail: "tidak dipakai ulang setelah dihapus" butuh penghitung per IED; dibuat bersama tambah komponen (fase 8)
 //!
 //! Dataset `LLN0.DS_ST` (semua titik ST) & `LLN0.DS_MX` (semua titik MX), masing-masing dengan
 //! BRCB `brcb<ST|MX>01..02` dan URCB `urcb<ST|MX>01..02`.
@@ -27,10 +31,79 @@ pub struct Component {
     pub kind: Kind,
 }
 
+/// ctlModel IEC 61850-7-3 (nilainya sama dengan enum di standar).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CtlModel {
+    StatusOnly = 0,
+    DirectNormal = 1,
+    SboNormal = 2,
+    DirectEnhanced = 3,
+    SboEnhanced = 4,
+}
+
+impl CtlModel {
+    /// controlOptions untuk `CDC_*_create`: struktur SBO/SBOw/Oper/Cancel + origin/ctlNum/stSeld.
+    fn options(self) -> u32 {
+        let m = self as u32;
+        match self {
+            Self::StatusOnly => m,
+            Self::DirectNormal | Self::DirectEnhanced => m | ffi::CDC_CTL_OPTION_ORIGIN | ffi::CDC_CTL_OPTION_CTL_NUM,
+            Self::SboNormal | Self::SboEnhanced => {
+                m | ffi::CDC_CTL_OPTION_ORIGIN
+                    | ffi::CDC_CTL_OPTION_CTL_NUM
+                    | ffi::CDC_CTL_OPTION_ST_SELD
+                    | ffi::CDC_CTL_MODEL_HAS_CANCEL
+            }
+        }
+    }
+
+    fn is_sbo(self) -> bool {
+        matches!(self, Self::SboNormal | Self::SboEnhanced)
+    }
+}
+
+/// Circuit Breaker: `XCBR<inst>` + `CSWI<inst>`.
+#[derive(Debug, Clone)]
+pub struct Cb {
+    /// Nomor instance LN, dikunci per komponen (tidak bergeser saat komponen lain dihapus)
+    pub inst: u32,
+    pub closed: bool,
+    pub ctl: CtlModel,
+    /// Lama di posisi intermediate saat operate
+    pub travel_ms: u64,
+    /// Loc = true: perintah ditolak (blocked-by-switching-hierarchy)
+    pub local: bool,
+    /// Tolak perintah yang minta interlock-check (blocked-by-interlocking)
+    pub interlock: bool,
+    /// true = perintah ke posisi yang sudah tercapai tetap diterima; false = tolak (position-reached)
+    pub accept_same: bool,
+    /// `CSWI.Pos.sboTimeout` (CF), hanya untuk model SBO
+    pub sbo_timeout_ms: u32,
+}
+
+impl Default for Cb {
+    fn default() -> Self {
+        Self {
+            inst: 1,
+            closed: false,
+            ctl: CtlModel::SboEnhanced,
+            travel_ms: 100,
+            local: false,
+            interlock: false,
+            accept_same: false,
+            sbo_timeout_ms: 30_000,
+        }
+    }
+}
+
 pub enum Kind {
-    CircuitBreaker { closed: bool },
-    /// `GGIO<ggio>.Ind<k>`; mode: manual / toggle
-    Telesignal { ggio: u32, value: bool, gen: Gen },
+    CircuitBreaker(Cb),
+    /// `YLTC<inst>` + `ATCC<inst>`. Posisi tap `min..=max` (posVal INT8: -64..63). `auto`: ATCC.Auto awal;
+    /// saat auto, tap bergerak 1 langkah tiap `interval_ms` (berbalik arah di batas) dan raise/lower
+    /// ditolak (blocked-by-mode).
+    TapChanger { inst: u32, pos: i32, min: i32, max: i32, ctl: CtlModel, local: bool, auto: bool, interval_ms: u64 },
+    /// `GGIO<ggio>.Ind<ind>`; mode: manual / toggle. Nomor dikunci per komponen.
+    Telesignal { ggio: u32, ind: u32, value: bool, gen: Gen },
     /// `follow_cb`: id CB; nilai jadi 0 selama CB tidak close (mis. arus saat CB open)
     Telemetry { mx: Mx, value: f64, gen: Gen, follow_cb: Option<String> },
 }
@@ -171,25 +244,47 @@ pub fn validate(cfg: &IedConfig) -> Result<(), String> {
             return Err(format!("id komponen duplikat: {}", c.id));
         }
         let err = |e: String| format!("komponen {}: {e}", c.id);
+        // Nomor instance/Ind dikunci per komponen: nol atau bentrok dengan komponen lain ditolak
+        let (inst, ln, path) = match &c.kind {
+            Kind::CircuitBreaker(cb) => (cb.inst, format!("XCBR{}", cb.inst), String::new()),
+            Kind::TapChanger { inst, .. } => (*inst, format!("ATCC{inst}"), String::new()),
+            Kind::Telesignal { ggio, ind, .. } => ((*ggio).min(*ind), format!("GGIO{ggio}"), format!("Ind{ind}")),
+            Kind::Telemetry { mx, .. } => (mx.inst, mx.ln(), mx.path()),
+        };
+        if inst == 0 {
+            return Err(err("nomor instance / Ind minimal 1".into()));
+        }
+        if !points.insert((ln.clone(), path.clone())) {
+            return Err(err(format!("{ln}{}{path} sudah dipakai komponen lain", if path.is_empty() { "" } else { "." })));
+        }
         match &c.kind {
-            Kind::CircuitBreaker { .. } => {}
-            Kind::Telesignal { ggio, gen, .. } => {
-                if *ggio == 0 {
-                    return Err(err("instance GGIO minimal 1".into()));
+            Kind::CircuitBreaker(cb) => {
+                if cb.travel_ms > 60_000 {
+                    return Err(err("waktu tempuh maksimal 60000 ms".into()));
                 }
+                if !(1000..=600_000).contains(&cb.sbo_timeout_ms) {
+                    return Err(err("sboTimeout harus 1000..600000 ms".into()));
+                }
+            }
+            Kind::TapChanger { pos, min, max, interval_ms, .. } => {
+                if !(-64..=63).contains(min) || !(-64..=63).contains(max) || min >= max {
+                    return Err(err(format!("batas tap harus -64 <= min < max <= 63 (min {min}, max {max})")));
+                }
+                if !(min..=max).contains(&pos) {
+                    return Err(err(format!("posisi tap {pos} di luar {min}..{max}")));
+                }
+                if *interval_ms < 100 {
+                    return Err(err("interval minimal 100 ms".into()));
+                }
+            }
+            Kind::Telesignal { gen, .. } => {
                 if !matches!(gen.mode, Mode::Manual | Mode::Toggle) {
                     return Err(err("telesignal hanya mendukung mode manual / toggle".into()));
                 }
                 gen.validate().map_err(err)?;
             }
             Kind::Telemetry { mx, gen, follow_cb, .. } => {
-                if mx.inst == 0 {
-                    return Err(err(format!("instance {:?} minimal 1", mx.class)));
-                }
                 mx.cdc().map_err(err)?;
-                if !points.insert((mx.ln(), mx.path())) {
-                    return Err(err(format!("{}.{} sudah dipakai komponen lain", mx.ln(), mx.path())));
-                }
                 if gen.mode == Mode::Toggle {
                     return Err(err("mode toggle hanya untuk telesignal".into()));
                 }
@@ -212,6 +307,7 @@ pub enum Val {
     Int(i32),
     Float(f64),
     Dbpos(ffi::Dbpos),
+    Uint(u32),
 }
 
 /// Satu titik data (punya stVal/mag + q + t). Reference relatif ke LD, mis. `XCBR1.Pos.stVal`.
@@ -224,12 +320,35 @@ pub struct Point {
     pub follow: Option<String>,
 }
 
+/// Objek kontrol (DO dengan ctlModel != status-only). Reference relatif ke LD, tanpa atribut.
+pub struct CtlSpec {
+    /// DO yang dikontrol client, mis. `CSWI1.Pos`, `ATCC1.TapChg`, `ATCC1.Auto`
+    pub do_ref: String,
+    /// `<LN>.Loc`: true = local, perintah ditolak
+    pub loc_ref: String,
+    pub interlock: bool,
+    /// false = status-only: tidak ada handler kontrol (spec tetap dipakai generator auto tap)
+    pub controllable: bool,
+    pub act: CtlAct,
+}
+
+pub enum CtlAct {
+    /// `mirror`: DO posisi yang ikut berubah (`XCBR<n>.Pos`)
+    /// `accept_same`: perintah ke posisi yang sudah tercapai diterima (bukan position-reached)
+    Cb { mirror: String, travel_ms: u64, accept_same: bool },
+    /// `mirror`: `YLTC<n>.TapPos`, `auto`: `ATCC<n>.Auto`
+    Tap { mirror: String, auto: String, min: i32, max: i32, interval_ms: u64 },
+    /// ATCC.Auto: tulis stVal = ctlVal
+    Auto,
+}
+
 /// Hasil build: model (milik pemanggil, wajib `IedModel_destroy`), atribut tetap, dan titik data.
 pub struct Built {
     pub model: *mut ffi::IedModel,
     pub fixed: Vec<(String, Val)>,
     pub vendor_refs: Vec<String>,
     pub points: Vec<Point>,
+    pub ctls: Vec<CtlSpec>,
 }
 
 fn c(s: &str) -> CString {
@@ -242,7 +361,7 @@ fn node<T>(p: *mut T) -> *mut ffi::ModelNode {
 
 /// Bangun model dari konfigurasi yang SUDAH lolos [`validate`].
 pub fn build(cfg: &IedConfig) -> Built {
-    let mut b = Built { model: ptr::null_mut(), fixed: Vec::new(), vendor_refs: Vec::new(), points: Vec::new() };
+    let mut b = Built { model: ptr::null_mut(), fixed: Vec::new(), vendor_refs: Vec::new(), points: Vec::new(), ctls: Vec::new() };
     let mut st: Vec<String> = Vec::new(); // anggota DS_ST, format MMS (LN$FC$DO)
     let mut mx: Vec<String> = Vec::new();
     let status = |b: &mut Built, do_ref: String, init: Val, gen: Gen| {
@@ -289,50 +408,107 @@ pub fn build(cfg: &IedConfig) -> Built {
         status(&mut b, "LPHD1.PhyHealth".into(), Val::Int(1), Gen::manual());
         status(&mut b, "LPHD1.Proxy".into(), Val::Bool(false), Gen::manual());
 
-        // id CB -> XCBR<n>.Pos.stVal (untuk follow_cb, urutan komponen bebas)
+        // id CB -> XCBR<inst>.Pos.stVal (untuk follow_cb, urutan komponen bebas)
         let cb_refs: Vec<(&str, String)> = cfg
             .components
             .iter()
-            .filter(|c| matches!(c.kind, Kind::CircuitBreaker { .. }))
-            .enumerate()
-            .map(|(i, c)| (c.id.as_str(), format!("XCBR{}.Pos.stVal", i + 1)))
+            .filter_map(|c| match &c.kind {
+                Kind::CircuitBreaker(cb) => Some((c.id.as_str(), format!("XCBR{}.Pos.stVal", cb.inst))),
+                _ => None,
+            })
             .collect();
-        let mut cb_n = 0;
-        let mut ind_n: Vec<(u32, u32)> = Vec::new(); // (instance GGIO, jumlah Ind)
+        // sboTimeout (CF) di DO kontrol; dibaca libIEC61850 setiap select
+        let sbo_timeout = |b: &mut Built, d: *mut ffi::DataObject, do_ref: String, ms: u32| {
+            ffi::DataAttribute_create(c("sboTimeout").as_ptr(), node(d), ffi::IEC61850_INT32U, ffi::IEC61850_FC_CF, 0, 0, 0);
+            b.fixed.push((format!("{do_ref}.sboTimeout"), Val::Uint(ms)));
+        };
         let mut wye_del: HashSet<(String, String)> = HashSet::new(); // DO WYE/DEL yang sudah dibuat
         for comp in &cfg.components {
             match &comp.kind {
-                Kind::CircuitBreaker { closed } => {
-                    cb_n += 1;
-                    let pos = Val::Dbpos(if *closed { ffi::DBPOS_ON } else { ffi::DBPOS_OFF });
-                    for (cls, ctl) in [("XCBR", false), ("CSWI", true)] {
-                        let lnn = format!("{cls}{cb_n}");
+                Kind::CircuitBreaker(cb) => {
+                    let n = cb.inst;
+                    let pos = Val::Dbpos(if cb.closed { ffi::DBPOS_ON } else { ffi::DBPOS_OFF });
+                    for (cls, is_ctl) in [("XCBR", false), ("CSWI", true)] {
+                        let lnn = format!("{cls}{n}");
                         let p = ln(&lnn);
-                        if ctl {
-                            // ponytail: status-only dulu, ctlModel dari UI + handler kontrol di fase 4
-                            ffi::CDC_DPC_create(c("Pos").as_ptr(), p, 0, ffi::CDC_CTL_MODEL_NONE);
-                            b.fixed.push((format!("{lnn}.Pos.ctlModel"), Val::Int(0)));
+                        if is_ctl {
+                            let d = ffi::CDC_DPC_create(c("Pos").as_ptr(), p, 0, cb.ctl.options());
+                            if cb.ctl.is_sbo() {
+                                sbo_timeout(&mut b, d, format!("{lnn}.Pos"), cb.sbo_timeout_ms);
+                            }
                         } else {
                             ffi::CDC_DPS_create(c("Pos").as_ptr(), p, 0);
                         }
                         ffi::CDC_SPS_create(c("Loc").as_ptr(), p, 0);
                         status(&mut b, format!("{lnn}.Pos"), pos, Gen::manual());
-                        status(&mut b, format!("{lnn}.Loc"), Val::Bool(false), Gen::manual()); // remote
+                        status(&mut b, format!("{lnn}.Loc"), Val::Bool(cb.local), Gen::manual());
                         st.push(format!("{lnn}$ST$Pos"));
                         st.push(format!("{lnn}$ST$Loc"));
                     }
+                    if cb.ctl != CtlModel::StatusOnly {
+                        b.ctls.push(CtlSpec {
+                            do_ref: format!("CSWI{n}.Pos"),
+                            loc_ref: format!("CSWI{n}.Loc"),
+                            interlock: cb.interlock,
+                            controllable: true,
+                            act: CtlAct::Cb { mirror: format!("XCBR{n}.Pos"), travel_ms: cb.travel_ms, accept_same: cb.accept_same },
+                        });
+                    }
                 }
-                Kind::Telesignal { ggio, value, gen } => {
-                    let k = match ind_n.iter_mut().find(|(g, _)| g == ggio) {
-                        Some((_, k)) => {
-                            *k += 1;
-                            *k
-                        }
-                        None => {
-                            ind_n.push((*ggio, 1));
-                            1
-                        }
-                    };
+                Kind::TapChanger { inst, pos, min, max, ctl, local, auto, interval_ms } => {
+                    let (yltc, atcc) = (format!("YLTC{inst}"), format!("ATCC{inst}"));
+                    ffi::CDC_INS_create(c("TapPos").as_ptr(), ln(&yltc), 0);
+                    let a = ln(&atcc);
+                    let d = ffi::CDC_BSC_create(c("TapChg").as_ptr(), a, 0, ctl.options(), false);
+                    if ctl.is_sbo() {
+                        // ponytail: tap belum punya setelan sboTimeout sendiri, pakai default CB
+                        sbo_timeout(&mut b, d, format!("{atcc}.TapChg"), Cb::default().sbo_timeout_ms);
+                    }
+                    // Auto/manual bisa dikontrol FEP (direct-normal) selama TapChg tidak status-only
+                    let auto_ctl = if *ctl == CtlModel::StatusOnly { CtlModel::StatusOnly } else { CtlModel::DirectNormal };
+                    ffi::CDC_SPC_create(c("Auto").as_ptr(), a, 0, auto_ctl.options());
+                    ffi::CDC_SPS_create(c("Loc").as_ptr(), a, 0);
+                    status(&mut b, format!("{yltc}.TapPos"), Val::Int(*pos), Gen::manual());
+                    b.points.push(Point {
+                        value_ref: format!("{atcc}.TapChg.valWTr.posVal"),
+                        t_ref: format!("{atcc}.TapChg.t"),
+                        init: Val::Int(*pos),
+                        gen: Gen::manual(),
+                        follow: None,
+                    });
+                    status(&mut b, format!("{atcc}.Auto"), Val::Bool(*auto), Gen::manual());
+                    status(&mut b, format!("{atcc}.Loc"), Val::Bool(*local), Gen::manual());
+                    for d in ["TapChg", "Auto", "Loc"] {
+                        st.push(format!("{atcc}$ST${d}"));
+                    }
+                    st.push(format!("{yltc}$ST$TapPos"));
+                    // spec Tap selalu ada (dipakai generator auto); handler hanya kalau bisa dikontrol
+                    let controllable = *ctl != CtlModel::StatusOnly;
+                    let loc_ref = format!("{atcc}.Loc");
+                    b.ctls.push(CtlSpec {
+                        do_ref: format!("{atcc}.TapChg"),
+                        loc_ref: loc_ref.clone(),
+                        interlock: false,
+                        controllable,
+                        act: CtlAct::Tap {
+                            mirror: format!("{yltc}.TapPos"),
+                            auto: format!("{atcc}.Auto"),
+                            min: *min,
+                            max: *max,
+                            interval_ms: *interval_ms,
+                        },
+                    });
+                    if controllable {
+                        b.ctls.push(CtlSpec {
+                            do_ref: format!("{atcc}.Auto"),
+                            loc_ref,
+                            interlock: false,
+                            controllable,
+                            act: CtlAct::Auto,
+                        });
+                    }
+                }
+                Kind::Telesignal { ggio, ind: k, value, gen } => {
                     let lnn = format!("GGIO{ggio}");
                     ffi::CDC_SPS_create(c(&format!("Ind{k}")).as_ptr(), ln(&lnn), 0);
                     status(&mut b, format!("{lnn}.Ind{k}"), Val::Bool(*value), gen.clone());
@@ -477,5 +653,19 @@ mod tests {
             kind: Kind::Telemetry { mx: Mx::preset("MW", 1, "").unwrap(), value: 0.0, gen: Gen::manual(), follow_cb: Some("x".into()) },
         }]);
         assert!(validate(&follow_salah).is_err());
+    }
+
+    #[test]
+    fn nomor_instance_dikunci_dan_unik() {
+        let k = |id: &str, kind| Component { id: id.into(), kind };
+        let cbk = |inst| Kind::CircuitBreaker(Cb { inst, ..Cb::default() });
+        let ts = |ggio, ind| Kind::Telesignal { ggio, ind, value: false, gen: Gen::manual() };
+        // nomor tidak harus berurutan (komponen di tengah boleh sudah dihapus)
+        assert!(validate(&cfg(vec![k("a", cbk(3)), k("b", cbk(1)), k("c", ts(1, 7)), k("d", ts(1, 2))])).is_ok());
+        assert!(validate(&cfg(vec![k("a", cbk(2)), k("b", cbk(2))])).unwrap_err().contains("XCBR2 sudah dipakai"));
+        assert!(validate(&cfg(vec![k("a", ts(1, 4)), k("b", ts(1, 4))])).unwrap_err().contains("GGIO1.Ind4"));
+        assert!(validate(&cfg(vec![k("a", cbk(0))])).is_err());
+        assert!(validate(&cfg(vec![k("a", ts(1, 0))])).is_err());
+        assert!(validate(&cfg(vec![k("a", Kind::CircuitBreaker(Cb { sbo_timeout_ms: 500, ..Cb::default() }))])).is_err());
     }
 }

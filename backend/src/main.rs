@@ -1,7 +1,9 @@
 //! Simulator IED IEC 61850: HTTP API + Socket.IO untuk UI tester.
-//! Fase 3: satu IED contoh dengan generator nilai, dataset & RCB otomatis.
+//! Fase 4: satu IED contoh (generator, dataset & RCB, kontrol CB + tap changer).
+//! `iec61850-simulator ctl <host> <port> <reference> <nilai> [--interlock]`: kirim perintah kontrol (uji tanpa FEP).
 
 mod behavior;
+mod client;
 mod config;
 mod ffi;
 mod logger;
@@ -17,10 +19,14 @@ use tower_http::cors::CorsLayer;
 use tracing::{error, info};
 
 use behavior::{Gen, Mode};
-use model::{Component, IedConfig, Kind, Mx};
+use model::{Cb, Component, CtlModel, IedConfig, Kind, Mx};
 
 #[tokio::main]
 async fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("ctl") {
+        std::process::exit(ctl_cmd(&args[2..]));
+    }
     dotenv::dotenv().ok();
     // Guard dipegang sampai akhir main: sisa log ditulis ke file saat di-drop.
     let _log_guard = logger::init_logger();
@@ -61,6 +67,29 @@ async fn run() -> Result<(), String> {
     Ok(())
 }
 
+/// `ctl <host> <port> <reference> <nilai> [--interlock]`, mis. `ctl 127.0.0.1 102 SIMIED1LD0/CSWI1.Pos open`
+fn ctl_cmd(a: &[String]) -> i32 {
+    let usage = "pakai: ctl <host> <port> <reference> <close|open|true|false|raise|lower> [--interlock]";
+    let res = (|| {
+        let [host, port, reference, val, rest @ ..] = a else { return Err(usage.to_string()) };
+        let port = port.parse().map_err(|_| format!("port tidak valid: {port}"))?;
+        let val = client::CtlVal::parse(val)?;
+        let interlock = rest.iter().any(|s| s == "--interlock");
+        let conn = client::Conn::connect(host, port)?;
+        client::control(&conn, reference, val, interlock, std::time::Duration::from_secs(10))
+    })();
+    match res {
+        Ok(s) => {
+            println!("OK: {s}");
+            0
+        }
+        Err(e) => {
+            println!("GAGAL: {e}");
+            1
+        }
+    }
+}
+
 /// IED contoh. ponytail: komponen tetap di kode; tambah/ubah dari UI di fase 8
 fn demo_ied(cfg: &config::Config) -> Result<IedConfig, String> {
     let g = |mode, interval_ms, min, max, scale| Gen { mode, interval_ms, min, max, scale, step: (max - min) * 0.05, period_s: 60.0 };
@@ -68,15 +97,21 @@ fn demo_ied(cfg: &config::Config) -> Result<IedConfig, String> {
         id: id.into(),
         kind: Kind::Telemetry { mx, value, gen, follow_cb: follow.map(Into::into) },
     };
-    let ts = |id: &str, value, gen| Component { id: id.into(), kind: Kind::Telesignal { ggio: 1, value, gen } };
+    let ts = |id: &str, ind, value, gen| Component { id: id.into(), kind: Kind::Telesignal { ggio: 1, ind, value, gen } };
+    let cb = |id: &str, c: Cb| Component { id: id.into(), kind: Kind::CircuitBreaker(c) };
     Ok(IedConfig {
         name: cfg.ied_name.clone(),
         ld: cfg.ld_name.clone(),
         port: cfg.mms_port,
         components: vec![
-            Component { id: "cb1".into(), kind: Kind::CircuitBreaker { closed: true } },
-            ts("ts1", true, g(Mode::Toggle, 5000, 0.0, 1.0, 0.0)),
-            ts("ts2", false, Gen::manual()),
+            cb("cb1", Cb { inst: 1, closed: true, ctl: CtlModel::SboEnhanced, ..Cb::default() }),
+            cb("cb2", Cb { inst: 2, closed: false, ctl: CtlModel::SboNormal, ..Cb::default() }),
+            Component {
+                id: "tap1".into(),
+                kind: Kind::TapChanger { inst: 1, pos: 9, min: 1, max: 17, ctl: CtlModel::DirectEnhanced, local: false, auto: false, interval_ms: 5000 },
+            },
+            ts("ts1", 1, true, g(Mode::Toggle, 5000, 0.0, 1.0, 0.0)),
+            ts("ts2", 2, false, Gen::manual()),
             tm("mw", Mx::preset("MW", 1, "")?, 50.0, g(Mode::RandomWalk, 1000, 0.0, 100.0, 0.1), Some("cb1")),
             tm("mvar", Mx::preset("MVAR", 1, "")?, 10.0, g(Mode::Random, 2000, -20.0, 20.0, 0.5), Some("cb1")),
             tm("hz", Mx::preset("Hz", 1, "")?, 50.0, g(Mode::RandomWalk, 1000, 49.8, 50.2, 0.01), None),
