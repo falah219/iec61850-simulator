@@ -1,0 +1,51 @@
+# Diisi install.sh lewat envsubst. Alamat backend sudah ditanam saat build image (VITE_BACKEND_URL).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: iec61850-simulator-frontend-${IMAGE_TAG}
+  namespace: ${NAMESPACE}
+  labels:
+    app: iec61850-simulator-frontend-${IMAGE_TAG}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: iec61850-simulator-frontend-${IMAGE_TAG}
+  template:
+    metadata:
+      labels:
+        app: iec61850-simulator-frontend-${IMAGE_TAG}
+    spec:
+      imagePullSecrets:
+        - name: ${PULL_SECRET}
+      containers:
+        - name: frontend
+          image: ${REGISTRY}/iec61850-simulator-frontend-${IMAGE_TAG}
+          imagePullPolicy: Always
+          ports:
+            - containerPort: ${UI_PORT}
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 200m
+              memory: 64Mi
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: iec61850-simulator-frontend-${IMAGE_TAG}-service
+  namespace: ${NAMESPACE}
+  labels:
+    app: iec61850-simulator-frontend-${IMAGE_TAG}
+spec:
+  type: NodePort
+  selector:
+    app: iec61850-simulator-frontend-${IMAGE_TAG}
+  ports:
+    - port: ${UI_PORT}
+      targetPort: ${UI_PORT}
+      nodePort: ${UI_NODEPORT}
+      protocol: TCP

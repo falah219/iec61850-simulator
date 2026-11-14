@@ -23,7 +23,20 @@ sama persis dengan FEP. Perubahan terhadap source asli sama dengan yang dicatat 
   diubah untuk hanya memanggil keduanya. (Simulator ini build dengan `-DBUILD_EXAMPLES=OFF`.)
 - Test & fuzzing yang tidak dipakai dihapus: `fuzz/`, `dotnet/tests/`, `pyiec61850/test_pyiec61850.py`.
 
-File lain (termasuk `COPYING`, `README.md`, `CHANGELOG`) tidak diubah.
+File lain (termasuk `COPYING`, `README.md`, `CHANGELOG`) tidak diubah, **kecuali** patch simulator di bawah.
+
+### Patch simulator (beda dengan salinan FEP)
+
+[backend/native/patches/0001-cpu-idle-loop.patch](backend/native/patches/0001-cpu-idle-loop.patch), sudah
+diterapkan ke source di `backend/native/libiec61850/` (ditandai komentar `iec61850-simulator`):
+
+- `src/mms/iso_server/iso_server.c` (`handleIsoConnections`): `poll()` menunggu 10 ms (asli 1 ms).
+
+Alasan: build ini memakai `CONFIG_MMS_SINGLE_THREADED` (default CMake), jadi tiap IED punya satu loop:
+`poll()` socket lalu `IedServer_performPeriodicTasks`. Dengan 1 ms loop berputar 1000x/detik per IED;
+100 IED idle memakai ~280% CPU (setelah patch ~60%). Fungsi tidak berubah: `poll()` langsung bangun
+saat ada koneksi / data dari client, report data-change tetap langsung; hanya resolusi tugas periodik
+(timer report BufTm / integrity, sboTimeout, polling operate) menjadi 10 ms.
 
 ### Lisensi
 
@@ -32,5 +45,6 @@ libIEC61850 berlisensi ganda: GPLv3 atau komersial. Simulator me-link libIEC6185
 
 ### Ganti versi
 
-Ikuti versi FEP: salin ulang `native/libiec61850/` dari repo `fep-61850`, perbarui versi & commit di
-file ini, lalu build ulang image backend.
+Ikuti versi FEP: salin ulang `native/libiec61850/` dari repo `fep-61850`, terapkan lagi patch simulator
+(`cd backend/native/libiec61850 && patch -p1 < ../patches/0001-cpu-idle-loop.patch`), perbarui versi &
+commit di file ini, lalu build ulang image backend.

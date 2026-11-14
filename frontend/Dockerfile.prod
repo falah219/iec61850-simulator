@@ -1,0 +1,20 @@
+# Frontend simulator untuk server / Kubernetes (dibuild install.sh): build Vite, lalu file statis
+# disajikan nginx (lebih kecil & ringan daripada `vite preview` di Dockerfile.local).
+
+FROM node:22 AS builder
+WORKDIR /srv/frontend
+COPY package*.json ./
+RUN npm ci
+COPY . .
+# Alamat backend ditanam saat build, mis. http://192.168.1.10:30061. Kosong = http://<host halaman>:6061
+ARG VITE_BACKEND_URL=
+ENV VITE_BACKEND_URL=${VITE_BACKEND_URL}
+RUN npm run build
+
+FROM nginx:1.27-alpine
+ARG UI_PORT=4061
+# routing UI memakai hash (#/ied/...), jadi cukup sajikan file statis
+RUN printf 'server {\n  listen %s;\n  root /usr/share/nginx/html;\n  location / { try_files $uri /index.html; }\n}\n' "${UI_PORT}" \
+        > /etc/nginx/conf.d/default.conf
+COPY --from=builder /srv/frontend/dist /usr/share/nginx/html
+EXPOSE ${UI_PORT}

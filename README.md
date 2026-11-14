@@ -40,6 +40,34 @@ Socket.IO dari UI: `subscribe_ied` / `unsubscribe_ied` (room per IED), `set_valu
 (hasil lewat ack `{ok, message}`), `get_initial_data`. Ke UI: `ieds`, `components` (config + nilai),
 `value_changed` (hanya yang berubah, tiap 300 ms, hanya ke room IED itu), `event_log`, `error`.
 
+## Deploy
+
+Hasil uji beban 100 IED (CPU, memori, latensi UI & kontrol): [docs/LOAD_TEST.md](docs/LOAD_TEST.md).
+
+**Server tanpa Kubernetes** (image prod: backend di-strip, UI disajikan nginx; port sama dengan dev):
+
+```sh
+VITE_BACKEND_URL=http://<ip-server>:6061 docker compose -f docker-compose.prod.yml up -d --build
+```
+
+**Kubernetes** (pola sama dengan `iec104_rtu_simulator`: build, push ke registry, `kubectl apply`):
+
+```sh
+./install.sh <image-tag> <http-port> <http-nodeport> <ui-nodeport> <backend-host> <mms-port-awal> [jumlah-port-mms=100] [ied-count=1]
+./install.sh 1 6061 30061 30041 192.168.1.10 30102 100 20
+./uninstall.sh 1               # volume autosave dibiarkan
+./uninstall.sh 1 --hapus-data  # ikut hapus konfigurasi semua IED
+```
+
+- Port MMS di dalam container dibuat **sama dengan NodePort** (`MMS_PORT` = mms-port-awal,
+  `MMS_PORT_BASE` = +1), jadi port yang tampil di UI = port yang dipakai FEP. Service berisi
+  `jumlah-port-mms` port (default 100: 30102-30201).
+- Env opsional: `REGISTRY` (grita.id/scada), `NAMESPACE` (scada-grita), `PULL_SECRET` (harbor-secret), `UI_PORT` (4061).
+- Autosave di PVC `iec61850-simulator-data-<tag>` (100 Mi, ReadWriteOnce), deployment `Recreate`.
+  `ied-count` hanya dipakai saat volume masih kosong.
+- Resource backend: request 500m / 128 Mi, limit 3 CPU / 512 Mi (dari uji beban). Probe `GET /health`.
+- Manifest: [backend/k8s/](backend/k8s/), [frontend/k8s/](frontend/k8s/) (diisi `envsubst` oleh install.sh).
+
 ## Konfigurasi: tambah / ubah / hapus, export / import, autosave
 
 - **Daftar IED**: *Tambah IED* (satu, atau banyak sekaligus dengan komponen disalin dari IED lain

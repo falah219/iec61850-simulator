@@ -13,6 +13,9 @@ fn main() {
     println!("cargo:rustc-link-lib=m");
     println!("cargo:rustc-link-lib=rt");
     println!("cargo:rerun-if-changed=wrapper.h");
+    // library statis berubah (versi baru / patch) -> link ulang; tanpa ini cache `target` memakai binary lama
+    println!("cargo:rerun-if-changed=/usr/local/lib/libiec61850.a");
+    println!("cargo:rerun-if-changed=/usr/local/lib/libhal.a");
 
     let bindings = bindgen::Builder::default()
         .header("wrapper.h")

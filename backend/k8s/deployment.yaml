@@ -1,0 +1,92 @@
+# Diisi install.sh lewat envsubst. Daftar port MMS di Service (MMS_SERVICE_PORTS) dibuat install.sh.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: iec61850-simulator-data-${IMAGE_TAG}
+  namespace: ${NAMESPACE}
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 100Mi
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: iec61850-simulator-backend-${IMAGE_TAG}
+  namespace: ${NAMESPACE}
+  labels:
+    app: iec61850-simulator-backend-${IMAGE_TAG}
+spec:
+  replicas: 1
+  # satu pod saja: volume ReadWriteOnce & port MMS tetap
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: iec61850-simulator-backend-${IMAGE_TAG}
+  template:
+    metadata:
+      labels:
+        app: iec61850-simulator-backend-${IMAGE_TAG}
+    spec:
+      imagePullSecrets:
+        - name: ${PULL_SECRET}
+      securityContext:
+        fsGroup: 999 # grup appuser di image, supaya volume /data bisa ditulis
+      containers:
+        - name: backend
+          image: ${REGISTRY}/iec61850-simulator-backend-${IMAGE_TAG}
+          imagePullPolicy: Always
+          ports:
+            - containerPort: ${HTTP_PORT}
+          envFrom:
+            - configMapRef:
+                name: iec61850-simulator-backend-${IMAGE_TAG}
+          # dari uji beban 100 IED: idle ~0.6 CPU / 55 MiB, puncak (badai data 100 IED) ~3 CPU / 120 MiB
+          resources:
+            requests:
+              cpu: 500m
+              memory: 128Mi
+            limits:
+              cpu: "3"
+              memory: 512Mi
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: ${HTTP_PORT}
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: ${HTTP_PORT}
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: iec61850-simulator-data-${IMAGE_TAG}
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: iec61850-simulator-backend-${IMAGE_TAG}-service
+  namespace: ${NAMESPACE}
+  labels:
+    app: iec61850-simulator-backend-${IMAGE_TAG}
+spec:
+  type: NodePort
+  selector:
+    app: iec61850-simulator-backend-${IMAGE_TAG}
+  ports:
+    - name: http
+      port: ${HTTP_PORT}
+      targetPort: ${HTTP_PORT}
+      nodePort: ${HTTP_NODEPORT}
+      protocol: TCP
+${MMS_SERVICE_PORTS}

@@ -1,0 +1,46 @@
+# Server tanpa Kubernetes: image prod (backend di-strip, frontend nginx).
+# Jalankan: VITE_BACKEND_URL=http://<ip-server>:6061 docker compose -f docker-compose.prod.yml up -d --build
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.prod
+    container_name: iec61850_backend_simulator
+    restart: unless-stopped
+    ports:
+      - "6061:6061"   # HTTP API + Socket.IO
+      - "102:102"     # MMS IED ke-1
+      - "10102-10200:10102-10200"   # MMS IED ke-2 dst
+    env_file:
+      - path: ./backend/.env   # opsional, salin dari backend/.env.example
+        required: false
+    environment:
+      - HTTP_PORT=6061
+      - MMS_PORT=102
+      - MMS_PORT_BASE=10102
+      - AUTOSAVE_PATH=/data/simulator.json
+      - LOG_TO_FILE=false
+    volumes:
+      - simulator-data:/data
+    healthcheck:
+      # image prod tanpa curl: binary sendiri melakukan GET /health
+      test: ["CMD", "/app/iec61850-simulator", "health"]
+      interval: 10s
+      timeout: 3s
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.prod
+      args:
+        VITE_BACKEND_URL: ${VITE_BACKEND_URL:-}
+        UI_PORT: "4061"
+    container_name: iec61850_frontend_simulator
+    restart: unless-stopped
+    ports:
+      - "4061:4061"
+    depends_on:
+      - backend
+
+volumes:
+  simulator-data:

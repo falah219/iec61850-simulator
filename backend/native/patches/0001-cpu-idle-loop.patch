@@ -1,0 +1,15 @@
+--- a/src/mms/iso_server/iso_server.c
++++ b/src/mms/iso_server/iso_server.c
+@@ -521,7 +521,11 @@
+         callTickHandlerForClientConnections(self);
+     }
+ 
+-    if (Handleset_waitReady(self->handleset, 1) < 1)
++    /* iec61850-simulator: 1 -> 10 ms. Build ini CONFIG_MMS_SINGLE_THREADED: satu loop per IED
++     * (poll ini + IedServer_performPeriodicTasks). Poll langsung bangun saat ada data/koneksi;
++     * timeout hanya menentukan resolusi tugas periodik (timer report, sboTimeout, polling operate).
++     * 1 ms = 1000 putaran/detik per IED -> ~280% CPU untuk 100 IED idle. */
++    if (Handleset_waitReady(self->handleset, 10) < 1)
+         return;
+ 
+     Socket connectionSocket;

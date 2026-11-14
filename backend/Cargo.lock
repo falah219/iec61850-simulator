@@ -480,6 +480,7 @@ dependencies = [
  "axum",
  "bindgen",
  "dotenv",
+ "serde",
  "serde_json",
  "socketioxide",
  "tokio",

@@ -40,6 +40,9 @@ async fn main() {
     if args.get(1).map(String::as_str) == Some("ctl") {
         std::process::exit(ctl_cmd(&args[2..]));
     }
+    if args.get(1).map(String::as_str) == Some("health") {
+        std::process::exit(health_cmd());
+    }
     dotenv::dotenv().ok();
     // Guard dipegang sampai akhir main: sisa log ditulis ke file saat di-drop.
     let _log_guard = logger::init_logger();
@@ -337,6 +340,23 @@ async fn get_events(State(app): State<Arc<App>>, Query(q): Query<HashMap<String,
     };
     let list = app.events.query(q.get("ied").map(String::as_str), kind, limit);
     Ok(Json(Value::Array(list.iter().map(events::Event::json).collect())))
+}
+
+/// `health`: GET /health ke backend sendiri (healthcheck Docker di image prod yang tanpa curl). 0 = sehat.
+fn health_cmd() -> i32 {
+    use std::io::{Read, Write};
+    let port = std::env::var("HTTP_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(6061u16);
+    let ok = (|| {
+        let mut s = std::net::TcpStream::connect_timeout(&([127, 0, 0, 1], port).into(), std::time::Duration::from_secs(2)).ok()?;
+        s.set_read_timeout(Some(std::time::Duration::from_secs(2))).ok()?;
+        s.write_all(b"GET /health HTTP/1.0
+
+").ok()?;
+        let mut buf = [0u8; 16];
+        let n = s.read(&mut buf).ok()?;
+        Some(buf[..n].windows(3).any(|w| w == b"200"))
+    })();
+    if ok == Some(true) { 0 } else { 1 }
 }
 
 /// `ctl <host> <port> <reference> <nilai> [--interlock]`, mis. `ctl 127.0.0.1 102 SIMIED1LD0/CSWI1.Pos open`

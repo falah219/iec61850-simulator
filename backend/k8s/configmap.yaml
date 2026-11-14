@@ -1,0 +1,15 @@
+# Diisi install.sh lewat envsubst. Port MMS di dalam container = NodePort, jadi port yang tampil di UI
+# sama dengan port yang dipakai FEP.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: iec61850-simulator-backend-${IMAGE_TAG}
+  namespace: ${NAMESPACE}
+data:
+  HTTP_PORT: "${HTTP_PORT}"
+  MMS_PORT: "${MMS_PORT}"
+  MMS_PORT_BASE: "${MMS_PORT_BASE}"
+  IED_COUNT: "${IED_COUNT}"
+  AUTOSAVE_PATH: "/data/simulator.json"
+  RUST_LOG: "info"
+  LOG_TO_FILE: "false"
